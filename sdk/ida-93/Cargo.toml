@@ -6,7 +6,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
 description = "IDA 9.3 build of the Rust-native multi-session headless MCP server"
-license = "MIT"
+license = "Apache-2.0"
 authors = ["ida-headless-mcp contributors"]
 build = "../../build.rs"
 

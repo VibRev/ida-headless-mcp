@@ -1,6 +1,12 @@
 ida-headless-mcp
-Copyright (c) 2026 fuqiuluo and ida-headless-mcp contributors
-Licensed under the MIT License.
+Copyright (c) 2026 VibRev Developers
+Licensed under the Apache License, Version 2.0. See LICENSE.
+
+The MIT notices below are not superseded by that relicensing. The portions they
+cover arrived under the MIT License and remain available under it; MIT permits
+redistribution under the Apache-2.0 terms this project now uses, on the
+condition that its copyright and permission notices are preserved, which is
+what this file does.
 
 This project contains substantial portions derived from ida-mcp-rs:
 https://github.com/blacktop/ida-mcp-rs

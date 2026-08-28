@@ -6,7 +6,7 @@
 
 本项目派生自 [blacktop/ida-mcp-rs](https://github.com/blacktop/ida-mcp-rs)，按明确的 supervisor / worker 拆分重写，会话模型借鉴自 [mrexodia/ida-pro-mcp](https://github.com/mrexodia/ida-pro-mcp)，但不再实现其工具契约。它不是上游 Homebrew / Scoop 包的即插即用替代品，也不是 Hex-Rays 官方产品。
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 ## 本项目多做了什么
 
@@ -228,6 +228,8 @@ IDA 绑定来自 [idalib](https://github.com/blacktop/idalib)（`MIT OR Apache-2
 
 ## 许可证
 
-MIT。Copyright (c) 2026 **blacktop**。Copyright (c) 2026 **fuqiuluo** 与 ida-headless-mcp 贡献者。
+Apache-2.0。Copyright (c) 2026 **VibRev Developers**。
+
+上面列出的上游部分是以 MIT License 引入的，仍然可以按 MIT 使用；按 MIT 的要求，它们的声明保留在 [NOTICE](NOTICE) 中。
 
 见 [LICENSE](LICENSE) 和 [NOTICE](NOTICE)。

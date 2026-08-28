@@ -6,7 +6,7 @@ Rust-native, multi-session headless [IDA Pro](https://hex-rays.com/ida-pro) MCP 
 
 This project is a derivative of [blacktop/ida-mcp-rs](https://github.com/blacktop/ida-mcp-rs), rewritten around an explicit supervisor/worker split and pinned to the [mrexodia/ida-pro-mcp](https://github.com/mrexodia/ida-pro-mcp) public contract. It is not a drop-in replacement for the upstream Homebrew/Scoop packages, and it is not an official Hex-Rays product.
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 ## What this project adds
 
@@ -245,6 +245,8 @@ Full notices are in [NOTICE](NOTICE).
 
 ## License
 
-MIT. Copyright (c) 2026 **blacktop**. Copyright (c) 2026 **fuqiuluo** and ida-headless-mcp contributors.
+Apache-2.0. Copyright (c) 2026 **VibRev Developers**.
+
+The upstream portions listed above arrived under the MIT License and stay available under it; their notices are preserved in [NOTICE](NOTICE) as MIT requires.
 
 See [LICENSE](LICENSE) and [NOTICE](NOTICE).
