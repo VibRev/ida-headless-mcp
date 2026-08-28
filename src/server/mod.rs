@@ -668,14 +668,19 @@ pub(crate) fn attach_analysis_coverage(
     }
 }
 
+/// The snapshots are boxed because this rides in the `Err` arm of every
+/// foreground tool call. `OperationSnapshot` is five `String`s and three
+/// counters, so inlining it made the whole `Result` 160 bytes wide on the
+/// success path too — paid by every call, for a payload only the two failure
+/// arms ever read.
 pub(crate) enum ForegroundOperationError {
     Tool(ToolError),
     TimedOut {
         timeout_secs: u64,
-        snapshot: OperationSnapshot,
+        snapshot: Box<OperationSnapshot>,
     },
     Cancelled {
-        snapshot: OperationSnapshot,
+        snapshot: Box<OperationSnapshot>,
     },
 }
 
@@ -1148,7 +1153,9 @@ impl IdaMcpServer {
                                     format!("{tool_name} cancelled"),
                                 )
                             });
-                        Err(ForegroundOperationError::Cancelled { snapshot })
+                        Err(ForegroundOperationError::Cancelled {
+                            snapshot: Box::new(snapshot),
+                        })
                     }
                     Err(error) => {
                         let _ = self
@@ -1180,7 +1187,7 @@ impl IdaMcpServer {
                     });
                 Err(ForegroundOperationError::TimedOut {
                     timeout_secs,
-                    snapshot,
+                    snapshot: Box::new(snapshot),
                 })
             }
             Outcome::Cancelled => {
@@ -1200,7 +1207,9 @@ impl IdaMcpServer {
                             format!("{tool_name} cancelled by client"),
                         )
                     });
-                Err(ForegroundOperationError::Cancelled { snapshot })
+                Err(ForegroundOperationError::Cancelled {
+                    snapshot: Box::new(snapshot),
+                })
             }
         }
     }

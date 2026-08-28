@@ -1,0 +1,22 @@
+# Check out LF everywhere, including on Windows.
+#
+# Two things in this repository break on CRLF, and both broke silently until CI
+# ran on a Windows runner:
+#
+#   `vibrev-skills`' frontmatter parser opens SKILL.md with
+#   `strip_prefix("---\n")`, which returns None against `---\r\n`. The build
+#   script then fails with "frontmatter has no `name:`" on a file that has one.
+#
+#   The e2e scripts are bash. A CRLF shebang line is not a shebang.
+#
+# Nothing tracked here is binary — the compiled fixtures and IDA databases are
+# generated and ignored — so a blanket rule is safe. The explicit binary lines
+# below exist so that an .i64 committed by accident is not mangled on top of
+# being committed by accident.
+* text=auto eol=lf
+
+*.i64 binary
+*.idb binary
+*.png binary
+*.zip binary
+*.tar.gz binary
