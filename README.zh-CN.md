@@ -137,6 +137,7 @@ idb_close(database: "<session_id>")
 几条能省一次往返的事实：
 
 - `input_path` 可以是原始二进制（Mach-O/ELF/PE），也可以是已有的 `.i64`/`.idb`。同一个规范化路径第二次打开会复用已存在的会话，而不是再起一个 worker。
+- 开头的 `~/` 按 `$HOME` 展开（Windows 上还认 `%USERPROFILE%` 与 `~\`）。其余路径相对服务进程的工作目录解析——由客户端拉起时那是客户端的目录，不是你的，所以写绝对路径更稳妥。
 - 会话闲置 `idle_ttl_sec` 秒后被回收（默认 600）；传 `0` 关闭回收。
 - `idb_open` 接受 `mode` 参数：`prefer_headless`（默认）、`force_headless` 和 `prefer_gui` 都会得到无头 worker；`force_gui` 返回稳定的不支持模式错误——本构建只支持无头。
 - `--max-workers`（默认 4）限制 supervisor 同时保活的 worker 进程数，两种传输都适用，每个打开的数据库占一个。环境变量是 `IDA_MCP_MAX_WORKERS`。

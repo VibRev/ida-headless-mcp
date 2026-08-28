@@ -149,6 +149,7 @@ idb_close(database: "<session_id>")
 Notes that save a round trip:
 
 - `input_path` may be a raw binary (Mach-O/ELF/PE) or an existing `.i64`/`.idb`. Opening the same canonical path twice returns the session that already exists instead of a second worker.
+- A leading `~/` is expanded from `$HOME` (and `%USERPROFILE%` on Windows, where `~\` also works). Everything else is resolved against the server's working directory, which is the client's, not yours, when the client spawns it — absolute paths are the safe habit.
 - Sessions are reaped after `idle_ttl_sec` seconds idle (default 600); pass `0` to disable.
 - `idb_open` takes a `mode`: `prefer_headless` (default), `force_headless`, and `prefer_gui` all yield a headless worker; `force_gui` returns a stable unsupported-mode error, because this build is headless-only.
 - `--max-workers` (default 4) caps how many worker processes the supervisor keeps alive at once, on either transport — one per open database. `IDA_MCP_MAX_WORKERS` is the env spelling.

@@ -619,20 +619,37 @@ impl SessionManager {
 }
 
 fn canonical_input_path(input_path: &str) -> Result<PathBuf, ToolError> {
+    canonical_input_path_with_home(input_path, crate::home_dir().as_deref())
+}
+
+/// Canonicalize what the client asked to open.
+///
+/// `~/` is expanded first, through the same [`crate::expand_path`] the worker's
+/// own `open_idb` uses: `canonicalize` has no idea what `~` means, so without
+/// this the documented `idb_open(input_path: "~/samples/x")` looked for a
+/// directory literally named `~` beside the server's working directory.
+///
+/// The home directory is a parameter so the expansion can be tested against a
+/// directory the test created rather than the developer's own.
+fn canonical_input_path_with_home(
+    input_path: &str,
+    home: Option<&std::ffi::OsStr>,
+) -> Result<PathBuf, ToolError> {
     let trimmed = input_path.trim();
     if trimmed.is_empty() {
         return Err(ToolError::InvalidPath(input_path.to_string()));
     }
+    let expanded = crate::expand_path_with_home(trimmed, home);
     #[cfg(windows)]
     let canonical = {
         // std::fs::canonicalize emits `\\?\` paths on Windows, which IDA rejects.
         // `dunce` keeps canonicalization while using legacy syntax whenever safe.
-        dunce::canonicalize(trimmed)
+        dunce::canonicalize(&expanded)
     };
     #[cfg(not(windows))]
-    let canonical = std::fs::canonicalize(trimmed);
+    let canonical = std::fs::canonicalize(&expanded);
 
-    canonical.map_err(|error| ToolError::InvalidPath(format!("{trimmed}: {error}")))
+    canonical.map_err(|error| ToolError::InvalidPath(format!("{}: {error}", expanded.display())))
 }
 
 fn validate_mode(mode: &str) -> Result<(), ToolError> {
@@ -806,9 +823,9 @@ mod tests {
     #[cfg(windows)]
     use super::canonical_input_path;
     use super::{
-        assemble_open_warmup, native_worker_tool, requested_session_id, snapshot_health,
-        validate_mode, warmup_rpc_failure, CurrentCall, ServerHealth, SessionHealthStatus,
-        SessionInfo, SessionManager,
+        assemble_open_warmup, canonical_input_path_with_home, native_worker_tool,
+        requested_session_id, snapshot_health, validate_mode, warmup_rpc_failure, CurrentCall,
+        ServerHealth, SessionHealthStatus, SessionInfo, SessionManager,
     };
     use crate::error::ToolError;
     use crate::ida::handlers::warmup::{BUILD_CACHES_STEP, INIT_HEXRAYS_STEP};
@@ -890,6 +907,35 @@ mod tests {
             !canonical.to_string_lossy().starts_with(r"\\?\"),
             "ordinary Windows paths passed to IDA must not use verbatim syntax"
         );
+    }
+
+    #[test]
+    fn a_tilde_input_path_opens_beneath_the_home_directory() {
+        let home = std::env::temp_dir().join(format!("ida-mcp-home-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(home.join("samples")).expect("create the isolated home");
+        let sample = home.join("samples").join("fixture.bin");
+        std::fs::write(&sample, b"MZ").expect("write the fixture");
+
+        let canonical =
+            canonical_input_path_with_home("~/samples/fixture.bin", Some(home.as_ref()));
+
+        let expected = std::fs::canonicalize(&sample).expect("canonical fixture path");
+        assert_eq!(canonical.expect("~/ must resolve"), expected);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_path_without_a_tilde_is_not_rewritten() {
+        let home = std::ffi::OsStr::new("/isolated/home");
+        let error = canonical_input_path_with_home("no/such/sample.i64", Some(home))
+            .expect_err("a path that does not exist cannot be canonicalized");
+
+        // The failure has to name the path the caller wrote: rewriting a
+        // relative path against the home directory would change what
+        // `idb_open` means for every caller who does not use `~/`.
+        let message = error.to_string();
+        assert!(message.contains("no/such/sample.i64"), "{message}");
+        assert!(!message.contains("/isolated/home"), "{message}");
     }
 
     #[test]
