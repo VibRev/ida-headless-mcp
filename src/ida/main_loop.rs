@@ -610,6 +610,27 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
     let mut _isolated_registry = init_state.isolated_registry;
 
     while let Ok(req) = rx.recv() {
+        // A guarded call took SIGSEGV or SIGBUS. IDA is not asked anything
+        // else in this process — not the request, not a close, not the drop of
+        // the open database — because the heap it would use is the one the
+        // jump out of the signal handler left in an unknown state. See
+        // `crate::crash_guard`, which is also terminating this process.
+        if let Some(signal) = crate::crash_guard::caught_signal() {
+            match req {
+                IdaRequest::Shutdown => {
+                    warn!(signal, "Worker shutting down after a caught fatal signal");
+                    break;
+                }
+                // `Close` answers with `()` and so cannot report this. Dropping
+                // its responder reaches the caller as `WorkerClosed`, which
+                // retires this worker — where a successful-looking close would
+                // hand it back to the pool as reusable.
+                IdaRequest::Close { resp, .. } => drop(resp),
+                other => reject_with_error(other, crate::crash_guard::retired_error(signal)),
+            }
+            continue;
+        }
+
         // Lazily initialize the IDA library on first use when startup preflight
         // intentionally deferred initialization (non-Windows or HTTP mode).
         if !lib_initialized {
@@ -2212,6 +2233,19 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                 break;
             }
         }
+    }
+
+    // Every way out of that loop meets this. After a caught signal the open
+    // database is leaked on purpose: dropping an `IDB` is IDA packing and
+    // writing it through the heap the jump out of the signal handler left in
+    // an unknown state, and losing the unsaved analysis beats saving a
+    // database assembled from a corrupt one. The lock is only a file, so that
+    // much is still cleaned up, and then the process leaves rather than
+    // returning into a normal shutdown that would run IDA's atexit handlers.
+    if crate::crash_guard::caught_signal().is_some() {
+        std::mem::forget(idb.take());
+        release_mcp_lock(&mut lock_file, &mut lock_path);
+        crate::crash_guard::exit_if_retired();
     }
 }
 

@@ -69,6 +69,10 @@ test-pool: build
 test-pool-crash: build
     cd e2e && SERVER_BIN=../target/debug/ida-headless-mcp RUST_LOG=ida_mcp=trace just test-pool-crash
 
+# Run the supervisor guarded-signal retirement test (debug, Linux only)
+test-crash-signal: build
+    cd e2e && SERVER_BIN=../target/debug/ida-headless-mcp RUST_LOG=ida_mcp=trace just test-crash-signal
+
 # Run HTTP worker-pool exhaustion test (debug)
 test-pool-exhaustion: build
     cd e2e && SERVER_BIN=../target/debug/ida-headless-mcp RUST_LOG=ida_mcp=trace just test-pool-exhaustion
@@ -117,7 +121,7 @@ test-dsc dsc_path="": build
 test-license: build
     cd e2e && SERVER_BIN=../target/debug/ida-headless-mcp RUST_LOG=ida_mcp=info just test-license
 
-# Run crash-guard integration test (triggers SIGSEGV, verifies server survives)
+# Run crash-guard integration test (triggers SIGSEGV, verifies the worker retires)
 test-crash-guard: build
     cd e2e && SERVER_BIN=../target/debug/ida-headless-mcp RUST_LOG=ida_mcp=trace just test-crash-guard
 

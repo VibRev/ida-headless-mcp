@@ -1139,10 +1139,21 @@ fn strings_child_args(query: &StringQuery, timeout_secs: Option<u64>) -> Value {
     })
 }
 
+/// Whether a tool-level failure means this worker must not be used again.
+///
+/// `WorkerRetired` is the child saying so itself: a guarded call took SIGSEGV
+/// or SIGBUS, and the process that answered is on its way out (see
+/// [`crate::crash_guard`]). Retiring it here is what makes the answer true from
+/// the parent's side — the lease is dropped, the child is killed, and the pool
+/// replenishes — rather than waiting for the child's own exit to arrive as a
+/// closed transport on some later, unrelated call.
 fn child_tool_error_retires_worker(err: &ToolError) -> bool {
     matches!(
         err,
-        ToolError::WorkerClosed | ToolError::WorkerCrashed { .. } | ToolError::RemoteProtocol(_)
+        ToolError::WorkerClosed
+            | ToolError::WorkerCrashed { .. }
+            | ToolError::WorkerRetired(_)
+            | ToolError::RemoteProtocol(_)
     )
 }
 
@@ -1155,6 +1166,7 @@ fn open_error_releases_lease(fresh_lease: bool, err: &ToolError) -> bool {
                 | ToolError::Cancelled(_)
                 | ToolError::WorkerCrashed { .. }
                 | ToolError::WorkerClosed
+                | ToolError::WorkerRetired(_)
         )
 }
 
@@ -1307,6 +1319,16 @@ mod tests {
             "run_script cancelled".to_string()
         )));
         assert!(child_tool_error_retires_worker(&ToolError::WorkerClosed));
+    }
+
+    /// A worker that jumped out of a signal handler is not reusable, and the
+    /// pool must not wait for its exit to notice: no later call may be routed
+    /// to that process.
+    #[test]
+    fn a_worker_that_caught_a_signal_is_retired_and_gives_up_its_lease() {
+        let retired = crate::crash_guard::retired_error(11);
+        assert!(child_tool_error_retires_worker(&retired));
+        assert!(open_error_releases_lease(false, &retired));
     }
 
     #[test]

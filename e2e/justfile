@@ -308,6 +308,30 @@ test-pool-crash: fixture
         bash ./http_pool.sh
     echo "✅ HTTP worker-pool crash-containment test passed"
 
+# Run the supervisor guarded-signal retirement test
+
+# A SIGSEGV the crash guard catches must retire that worker and invalidate only
+# its session, leaving the supervisor able to open a fresh one. Linux only;
+# `test-crash-guard` covers the same catch on the bare worker face.
+test-crash-signal: fixture
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -x "{{ server_bin }}" ]; then
+        echo "Server binary not found: {{ server_bin }}"
+        echo "Run 'just build' first"
+        exit 1
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "jq is required for the guarded-signal test (brew install jq)"
+        exit 1
+    fi
+    echo "🧪 Running supervisor guarded-signal retirement test..."
+    PORT=$((9900 + RANDOM % 90)) \
+        RUST_LOG="{{ rust_log }}" IDB_PATH="{{ test_bin }}" \
+        MCP_HTTP_BIN="{{ server_bin }}" \
+        bash ./supervisor_crash_signal.sh
+    echo "✅ Supervisor guarded-signal retirement test passed"
+
 # Run HTTP worker-pool exhaustion test
 test-pool-exhaustion: fixture
     #!/usr/bin/env bash
@@ -550,11 +574,12 @@ measure-tools:
         bash ./measure_tools.sh
 
 # Run crash-guard integration test
-# Verifies that SIGSEGV during a handler call is caught and converted to a
-# ToolError instead of killing the server. Triggers a real segfault via
-# IDAPython ctypes.string_at(0) and checks the session_id stays stable
+# Verifies that SIGSEGV during a handler call is caught and turned into an
+# answer rather than a silent death, and then that the worker retires itself:
+# a process that jumped out of a signal handler must not serve the next
+# request. Triggers a real segfault via IDAPython signal.raise_signal.
 
-# across the crash (proof the server process didn't restart).
+# Worker-mode half of the story; `test-pool-crash-signal` covers the supervisor.
 test-crash-guard: test-bootstrap
     #!/usr/bin/env bash
     set -euo pipefail
@@ -630,13 +655,15 @@ test-crash-guard: test-bootstrap
     # Open the pre-built .i64 fixture
     send '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"open_idb","arguments":{"path":"fixtures/mini.i64"}}}'
     open_resp=$(wait_response 2 30)
-    session_before=$(echo "$open_resp" | jq -r '.result.content[0].text' | jq -r '.session_id // empty')
-    if [ -z "$session_before" ]; then
-        echo "❌ open_idb did not return a session_id"
+    # The worker face answers with the database, not a session ID: sessions are
+    # the supervisor's, and this test drives the worker directly.
+    functions=$(echo "$open_resp" | jq -r '.result.content[0].text' | jq -r '.function_count // empty')
+    if [ -z "$functions" ]; then
+        echo "❌ open_idb did not open the fixture"
         echo "$open_resp" | jq .
         exit 1
     fi
-    echo "   opened session=${session_before:0:8}"
+    echo "   opened fixtures/mini.i64 ($functions functions)"
 
     # Test 1: decompile at invalid address — clean error path through the guard
     send '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"decompile","arguments":{"address":"0xDEADBEEF"}}}'
@@ -644,46 +671,103 @@ test-crash-guard: test-bootstrap
     text=$(echo "$resp" | jq -r '.result.content[0].text // empty')
     echo "   decompile 0xDEADBEEF → ${text:0:60}"
 
+    # A response reader that does not treat a dead server as a failure: past
+    # this point the worker is expected to leave, and only the checks below
+    # decide whether it left for the right reason.
+    read_response() {
+        local target_id="$1" timeout="${2:-10}" elapsed=0 line
+        while [ "$elapsed" -lt "$timeout" ]; do
+            line=$(grep -m1 "\"id\":${target_id}[,}]" "$log" 2>/dev/null | grep '"jsonrpc"' || true)
+            if [ -n "$line" ]; then
+                echo "$line"
+                return 0
+            fi
+            sleep 1
+            elapsed=$((elapsed + 1))
+        done
+        return 1
+    }
+
     # Test 2: deliberate SIGSEGV via IDAPython — Linux-only.
     # macOS delivers EXC_BAD_ACCESS as a Mach exception which bypasses Unix
     # signal handlers when IDA registers its own Mach handler. The crash guard
     # works for IDA-internal crashes on both platforms (verified against
-    # kernelcache decompile) but this synthetic ctypes.string_at(0) path
-    # exercises signal-delivered SIGSEGV which only works on Linux.
-    if [ "$(uname -s)" = "Linux" ]; then
-        # Raise SIGSEGV synchronously on the IDA worker thread. Expected
-        # outcome: the signal is caught, an ERROR is logged, but the
-        # run_script response itself may be dropped (tokio foreground
-        # operation machinery is in a weird state after siglongjmp skipped
-        # its destructors). The real verification is that the SERVER is
-        # still alive and processing subsequent requests.
-        send '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"run_script","arguments":{"code":"import signal\nsignal.raise_signal(signal.SIGSEGV)"}}}'
-        sleep 3   # let the crash path complete and log the ERROR line
-        if ! grep -q 'crashed in IDA SDK (signal 11)\|signal 11 caught' "$log"; then
-            echo "❌ expected crash-guard catch message not in log" >&2
-            tail -20 "$log" >&2
-            exit 1
-        fi
-        echo "   SIGSEGV caught by guard (ERROR logged)"
-    else
+    # kernelcache decompile) but this synthetic raise_signal path exercises
+    # signal-delivered SIGSEGV which only works on Linux.
+    if [ "$(uname -s)" != "Linux" ]; then
         echo "   (skipping forced SIGSEGV on macOS — Mach exceptions bypass signal handlers)"
+        send '{"jsonrpc":"2.0","id":99,"method":"tools/call","params":{"name":"close_idb","arguments":{}}}'
+        wait_response 99 10 >/dev/null
+        echo "✅ Crash-guard test passed (clean error path only)"
+        exit 0
     fi
 
-    # Test 3: server is still alive and session_id is unchanged
-    # (this is the real proof the crash guard did its job — server survived
-    # the signal and can still process new requests on the same session)
+    # Raise SIGSEGV synchronously on the IDA worker thread. The guard catches
+    # it, answers the call, and then retires the process: everything after this
+    # point asserts the retirement, because a worker that jumped out of a
+    # signal handler must not serve another request.
+    send '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"run_script","arguments":{"code":"import signal\nsignal.raise_signal(signal.SIGSEGV)"}}}'
+    # Queued immediately behind it, while the worker is certainly still alive:
+    # the IDA loop is FIFO, so this one is dequeued after the crash and before
+    # the exit the guard has just armed. Sending it later would race that exit
+    # and write to a fifo nobody is reading.
     send '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"analysis_status","arguments":{}}}'
-    resp=$(wait_response 5 15) || { echo "❌ server died or hung after Test 2"; exit 1; }
-    session_after=$(echo "$resp" | jq -r '.result.content[0].text' | jq -r '.session_id // empty')
-    if [ "$session_before" != "$session_after" ]; then
-        echo "❌ session_id changed: ${session_before:0:8} → ${session_after:0:8} (server restarted)"
+
+    sleep 3   # let the crash path complete and log the ERROR line
+    if ! grep -q 'signal 11 caught' "$log"; then
+        echo "❌ expected crash-guard catch message not in log" >&2
+        tail -20 "$log" >&2
         exit 1
     fi
-    echo "   server alive after crash, session_id stable: ${session_after:0:8}"
+    echo "   SIGSEGV caught by guard (ERROR logged)"
 
-    # Close
-    send '{"jsonrpc":"2.0","id":99,"method":"tools/call","params":{"name":"close_idb","arguments":{}}}'
-    wait_response 99 10 >/dev/null
+    # The crashing call is answered, when the answer still gets out: the
+    # foreground machinery was left mid-flight by the jump, so a dropped
+    # response is tolerated — a *successful* one is not.
+    crash_resp=$(read_response 4 5 || true)
+    if [ -n "$crash_resp" ]; then
+        crash_text=$(echo "$crash_resp" | jq -r '.result.content[0].text // empty')
+        case "$crash_text" in
+            *"worker retired after a fatal signal"*)
+                echo "   run_script answered with the retirement" ;;
+            *)
+                echo "❌ guarded crash did not report a retired worker: ${crash_text:0:120}" >&2
+                exit 1 ;;
+        esac
+    fi
+
+    # Test 3: the request queued after the signal is refused rather than
+    # served. A dropped response is tolerated for the same reason as above.
+    stale_resp=$(read_response 5 5 || true)
+    if [ -n "$stale_resp" ]; then
+        stale_text=$(echo "$stale_resp" | jq -r '.result.content[0].text // empty')
+        case "$stale_text" in
+            *"worker retired after a fatal signal"*)
+                echo "   later request refused, not served" ;;
+            *)
+                echo "❌ a request after the signal was served: ${stale_text:0:120}" >&2
+                exit 1 ;;
+        esac
+    fi
+
+    # And the process leaves on its own. Under `serve` the supervisor would
+    # have retired it already; run bare, this exit is the whole recovery.
+    deadline=$((SECONDS + 20))
+    while kill -0 "$server_pid" 2>/dev/null && [ "$SECONDS" -lt "$deadline" ]; do
+        sleep 1
+    done
+    if kill -0 "$server_pid" 2>/dev/null; then
+        echo "❌ worker kept running after a caught signal" >&2
+        exit 1
+    fi
+    status=0
+    wait "$server_pid" || status=$?
+    if [ "$status" -ne 139 ]; then
+        echo "❌ worker exited with $status; expected 139 (128 + SIGSEGV)" >&2
+        tail -20 "$log" >&2
+        exit 1
+    fi
+    echo "   worker retired itself (exit 139)"
     echo "✅ Crash-guard test passed"
 
 dsc_test_path := env_var_or_default("DSC_TEST_PATH", "/tmp/ios_sys_mount/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64e")

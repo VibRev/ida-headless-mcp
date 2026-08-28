@@ -427,6 +427,14 @@ pub(crate) const OPEN_IDB_REQUEST_STATE_TTL_SECS: u64 = 10 * 60;
 /// Give foreground operations a short window to observe cancellation and clean
 /// up owned resources before the MCP timeout/cancel response is returned.
 pub(crate) const FOREGROUND_CANCEL_CLEANUP_TIMEOUT_SECS: u64 = 6;
+/// How long a finished operation waits for its progress drain to notice.
+///
+/// Normally microseconds: the drain ends when the last `ProgressSender` is
+/// dropped, which the operation does as it returns. The bound is for the case
+/// where one is *not* dropped — `crash_guard` catching a signal jumps over the
+/// destructors of the frame holding a clone — because waiting forever there
+/// swallows the very answer that says the worker crashed.
+const PROGRESS_DRAIN_GRACE: Duration = Duration::from_millis(200);
 
 pub(crate) fn pretty_json(value: &Value) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|err| {
@@ -1098,7 +1106,7 @@ impl IdaMcpServer {
         // response when fast tools coalesce into a single Node stdin `data`
         // event, dropping the Claude Code transport with "unknown progress
         // token". Phases remain observable via `recent_operations`.
-        let drain_task = tokio::spawn({
+        let mut drain_task = tokio::spawn({
             let registry = self.operation_registry.clone();
             let op_id = op_id.clone();
             async move {
@@ -1131,7 +1139,20 @@ impl IdaMcpServer {
 
         match outcome {
             Outcome::Finished(result) => {
-                let _ = drain_task.await;
+                // Bounded on purpose; see `PROGRESS_DRAIN_GRACE`. The other two
+                // arms already abort this task, and this one used to be the
+                // arm that could not — a crashed call leaves a sender alive,
+                // and an unbounded await here never returned.
+                if tokio::time::timeout(PROGRESS_DRAIN_GRACE, &mut drain_task)
+                    .await
+                    .is_err()
+                {
+                    warn!(
+                        tool_name,
+                        "progress drain did not finish with the operation; abandoning it"
+                    );
+                    drain_task.abort();
+                }
                 match result {
                     Ok(value) => {
                         let _ = self.operation_registry.finish_completed(

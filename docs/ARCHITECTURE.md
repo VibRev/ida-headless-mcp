@@ -35,6 +35,29 @@ flowchart LR
   reaped only if it is still idle at the moment the close commits, so a call
   accepted while the reaper was deciding keeps its session.
 
+## Crashes
+
+`src/crash_guard.rs` catches SIGSEGV and SIGBUS raised inside an SDK call and
+turns them into an answer. That answer is a diagnosis, not a recovery: the jump
+out of the signal handler skipped the destructors IDA was owed, so the process
+is retired rather than reused.
+
+- The worker refuses every later request, naming the signal, and exits with
+  `128 + signal` after a short grace period for the answer to be written. It
+  does not close the database first — dropping an open `IDB` is IDA code, and
+  the heap is what has just become untrustworthy. The file lock is released,
+  and the parent (or the stale-lock sweep) removes what the exit left behind.
+- The supervisor recognises that answer, retires that child, invalidates only
+  the session that was using it, and replenishes the pool. Other sessions are
+  unaffected; `idb_open` starts a fresh worker.
+- Run as a bare `worker` there is no supervisor to do any of that, so the
+  process simply exits and its client must start a new one.
+
+macOS delivers `EXC_BAD_ACCESS` as a Mach exception, which bypasses the Unix
+signal handler once IDA has installed its own — crashes inside IDA are still
+caught there, but a synthetic `raise_signal` is not, which is why the
+signal-path e2e tests are Linux-only.
+
 ## SDK versions
 
 Builds select exactly one of `ida-92`, `ida-93`, or `ida-94`. The selected

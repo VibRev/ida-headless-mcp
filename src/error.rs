@@ -108,6 +108,19 @@ pub enum ToolError {
         detail: Box<serde_json::Value>,
     },
 
+    /// A guarded IDA call took SIGSEGV or SIGBUS, and the worker that ran it is
+    /// on its way out.
+    ///
+    /// Distinct from [`ToolError::WorkerCrashed`], which is what the *parent*
+    /// says about a child that died or stopped answering. This one is the
+    /// child's own account of a crash it survived long enough to describe, and
+    /// it is what turns "the call failed" into "this worker is finished": see
+    /// [`crate::crash_guard`]. Self-describing, like
+    /// [`ToolError::IdaInstallFault`] — a prefix would be read before the
+    /// sentence that says which operation crashed and what to do next.
+    #[error("{0}")]
+    WorkerRetired(String),
+
     #[error("Not supported: {0}")]
     NotSupported(String),
 

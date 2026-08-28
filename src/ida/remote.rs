@@ -42,6 +42,7 @@ pub(crate) fn is_lifecycle_error(err: &ToolError) -> bool {
         err,
         ToolError::WorkerClosed
             | ToolError::WorkerCrashed { .. }
+            | ToolError::WorkerRetired(_)
             | ToolError::Timeout(_)
             | ToolError::TimeoutDetailed(_)
             | ToolError::Cancelled(_)
@@ -169,6 +170,12 @@ pub(crate) fn result_error(result: &CallToolResult, tool: &str) -> Option<ToolEr
 
 fn classify_child_error(message: String) -> ToolError {
     let lowered = message.to_ascii_lowercase();
+    // First, and before the timeout and cancellation phrases: a child that
+    // jumped out of a signal handler must be retired whatever else its message
+    // happens to say.
+    if lowered.contains(crate::crash_guard::WORKER_RETIRED_MARKER) {
+        return ToolError::WorkerRetired(message);
+    }
     if lowered.contains("worker channel closed") {
         return ToolError::WorkerClosed;
     }
@@ -298,6 +305,38 @@ mod tests {
         let err = result_error(&result, "close_idb").expect("worker closed must be classified");
 
         assert!(matches!(err, ToolError::WorkerClosed));
+    }
+
+    /// The child's own account of a caught SIGSEGV has to survive being
+    /// flattened to `isError` + a sentence, because retiring the worker on the
+    /// parent's side is what stops the next call reaching the same process.
+    #[test]
+    fn a_caught_signal_retires_the_worker_that_reported_it() {
+        let reported = crate::crash_guard::retired_error(11);
+        let result = reported.to_tool_result();
+
+        let err = result_error(&result, "decompile").expect("a retirement must be classified");
+
+        assert!(matches!(err, ToolError::WorkerRetired(_)), "{err}");
+        // Lifecycle, not tool-level: the supervisor drops the session instead
+        // of forwarding this as an answer the database could give again.
+        assert!(crate::ida::remote::is_lifecycle_error(&err));
+    }
+
+    #[test]
+    fn a_retirement_outranks_the_other_phrases_in_its_message() {
+        // The sentence tells the caller to open the database again, and an
+        // operation that was cancelled *by* the crash can say so. Neither may
+        // demote a retirement to a routine cancellation, which would leave the
+        // worker leasable.
+        let result = CallToolResult::error(vec![Content::text(format!(
+            "run_script was cancelled; {}: signal 11",
+            crate::crash_guard::WORKER_RETIRED_MARKER
+        ))]);
+
+        let err = result_error(&result, "run_script").expect("a retirement must be classified");
+
+        assert!(matches!(err, ToolError::WorkerRetired(_)), "{err}");
     }
 
     #[test]
