@@ -311,13 +311,16 @@ pub(crate) fn loaded_core_dir() -> Option<PathBuf> {
     found
 }
 
-/// dyld's image list, declared here rather than taken from `libc`.
-///
-/// `libc` deprecated both of these in favour of `mach2`, and this crate's
-/// clippy gate is `-D warnings`, so using them would fail the build. They are
-/// two stable C entry points in libSystem, which every macOS binary links, so
-/// declaring them costs one extern block and saves a dependency added for two
-/// signatures.
+// dyld's image list, declared here rather than taken from `libc`.
+//
+// `libc` deprecated both of these in favour of `mach2`, and this crate's clippy
+// gate is `-D warnings`, so using them would fail the build. They are two
+// stable C entry points in libSystem, which every macOS binary links, so
+// declaring them costs one extern block and saves a dependency added for two
+// signatures.
+//
+// `//`, not `///`: rustdoc does not document extern blocks, and a doc comment
+// on one is itself a warning — which is the same gate, failing the same way.
 #[cfg(target_os = "macos")]
 unsafe extern "C" {
     fn _dyld_image_count() -> u32;
