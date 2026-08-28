@@ -478,11 +478,24 @@ fn tool(
 
 /// Output schema for a successful supervisor session-tool call. Failures use
 /// `isError: true` and carry no `structuredContent`, just like routed tools.
+///
+/// `schema_for_output` produces a standalone schema *document*, and a document
+/// carries the `$schema` dialect key at its root. An `outputSchema` is a schema,
+/// not a document: no routed tool publishes that key, and
+/// `the_shared_tool_surface_contract_holds` audits every advertised tool for it.
+///
+/// Only `$schema` goes. `$defs` stays, which is what separates this from
+/// [`detach_schema_document_keys`] — that one is for a schema about to be nested
+/// inside a larger document, where the `#/$defs/...` pointers would dangle
+/// unless the definitions are lifted to the new root. Here the schema really is
+/// its own root, so they already resolve.
 fn session_output_schema<T>() -> Arc<rmcp::model::JsonObject>
 where
     T: rmcp::schemars::JsonSchema + std::any::Any,
 {
-    crate::server::responses::schema::<T>()
+    let mut schema = (*crate::server::responses::schema::<T>()).clone();
+    schema.remove("$schema");
+    Arc::new(schema)
 }
 
 /// `server_health` has two success shapes: one session or every session.
