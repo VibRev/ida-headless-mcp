@@ -1,10 +1,9 @@
 //! Snapshot test for our own tool surface.
 //!
-//! This replaces the old `compat_contract` test, which pinned the surface to a
-//! dump of the upstream `mrexodia/ida-pro-mcp` Python server. The project no
-//! longer claims contract-level compatibility with that project (ADR-12), so
-//! the snapshot object is now the surface we actually implement: the native
-//! `#[tool]` catalog, the supervisor's public catalog, and the resource URIs.
+//! The snapshot object is the surface this project implements — the native
+//! `#[tool]` catalog, the supervisor's public catalog, and the resource URIs —
+//! not a dump of the upstream `mrexodia/ida-pro-mcp` Python server. This
+//! project does not claim contract-level compatibility with it.
 //!
 //! Schemas are intentionally not byte-pinned: they are generated from our own
 //! request structs by schemars, so pinning them would only produce churn. What
@@ -25,12 +24,10 @@ use vibrev_kit::contract::{Audit, SurfaceReport};
 
 /// Supervisor-implemented session tools that publish an `outputSchema`.
 ///
-/// Not a ratchet. An 87-name `TOOLS_WITH_OUTPUT_SCHEMA` used to sit beside this,
-/// one entry per tool converted to publish a schema — but the conversion
-/// finished, and a finished ratchet says "all of them" in 87 lines while making
-/// every new tool an edit to a list. `vibrev-kit`'s `OutputSchemas::Required`
+/// Not a ratchet. A name-per-tool list would say "all of them" the long way and
+/// make every new tool an edit to it; `vibrev-kit`'s `OutputSchemas::Required`
 /// says it in one word and covers a tool the day it lands. (`Staged(&[..])` is
-/// still there for a conversion that is genuinely mid-flight.)
+/// there for a conversion that is genuinely mid-flight.)
 ///
 /// What survives is the IDA-specific half: a session tool answers failure in the
 /// payload rather than through `isError`, so its schema has to admit both arms —
@@ -38,9 +35,7 @@ use vibrev_kit::contract::{Audit, SurfaceReport};
 const SESSION_TOOLS_WITH_OUTPUT_SCHEMA: &[&str] =
     &["idb_close", "idb_list", "idb_open", "server_health"];
 
-// ===========================================================================
-// ADR-25: tools that must report how complete the analysis was
-// ===========================================================================
+// Tools that must report how complete the analysis was.
 //
 // `open_idb` returns before auto-analysis settles. Every tool below answers
 // with a count, a list or a nullable slot read out of an index the analyzer
@@ -248,18 +243,18 @@ fn an_unknown_name_resolves_to_no_native_tool() {
 
 /// Both faces, checked against the cross-engine contract in `vibrev-kit`.
 ///
-/// This one call replaces seven tests that used to live in this file or beside
-/// it in `src/server/tests.rs`: titles are
+/// One call covers seven separate assertions: titles are
 /// present and say something the name and description do not, annotations carry
 /// an explicit `readOnlyHint`, every tool publishes an `outputSchema`, no `$ref`
 /// dangles, no `$schema` dialect key leaks, no input schema publishes a numeric
-/// `format` a strict consumer would refuse, ADR-25's coverage block is *required*
-/// where it is owed, and the catalog comes out in the same order twice.
+/// `format` a strict consumer would refuse, the `analysis_coverage` block is
+/// *required* where it is owed, and the catalog comes out in the same order
+/// twice.
 ///
-/// They moved because none of them was about IDA. ADR-15 put the MCP face inside
-/// each engine and wrote down the price — *"三个引擎之间的手感一致性没有任何机制
-/// 强制"* — and seven assertions that only ever ran against this engine were the
-/// shape that price took. The `uint*` one is the clearest case: this engine had
+/// They moved because none of them was about IDA. Each engine carries its own
+/// MCP face, and nothing forces consistency between engines; seven assertions
+/// that only ever ran against this one were the shape that gap took. The
+/// `uint*` one is the clearest case: this engine had
 /// banned unsigned formats since before the scan existed, `bn-headless-mcp`
 /// published them on every paged tool, and neither repository could see the
 /// other's position. `bn-headless-mcp` now runs the same scan
@@ -383,11 +378,11 @@ fn the_supervisor_face_is_object_rooted_and_keeps_its_schemas() {
     }
 }
 
-/// The four tools that used to answer array-or-object now answer one shape.
+/// These four answer one shape, not array-or-object.
 ///
 /// An `anyOf` or array root here would make the supervisor's `{result: ...}`
-/// wrapper advertisement wrong for half the calls, which is why these had no
-/// schema at all until the shape was unified.
+/// wrapper advertisement wrong for half the calls — which is why the shape has
+/// to stay unified for them to publish a schema at all.
 #[test]
 fn the_reshaped_four_publish_an_object_rooted_results_schema() {
     for name in ["basic_blocks", "callees", "callers", "read_struct"] {
@@ -449,11 +444,11 @@ fn the_supervisor_wraps_array_valued_output_schemas() {
 /// The `resources/*` face reads lists out of `tools/*` answers, so a tool that
 /// changes its root shape silently breaks a resource.
 ///
-/// This is the check that was missing. ADR-25 gave every statistics tool an
-/// `analysis_coverage` block; `imports` and `exports` had nowhere to put it, so
-/// they grew an object root (`{imports|exports, analysis_coverage}`) while
-/// `segments` and `entrypoints` stayed bare arrays. `supervisor::resource` went
-/// on calling `as_array()` on the root, which is `None` for an object, so
+/// Every statistics tool carries an `analysis_coverage` block. `imports` and
+/// `exports` have nowhere to put it on a bare array, so they use an object root
+/// (`{imports|exports, analysis_coverage}`) while `segments` and `entrypoints`
+/// stay arrays. Read the root with `as_array()` — which is `None` for an
+/// object — and
 /// `ida://import/<name>` and `ida://export/<name>` answered "not found" for
 /// every name — including names the tools themselves had just returned. The
 /// tool face was verified after that change; the resource face was not.
@@ -528,11 +523,11 @@ fn every_resource_list_source_matches_the_tool_it_reads() {
 
 /// The output cache must not change the advertised shape.
 ///
-/// It used to. Over the threshold, `OutputCache::compact` replaced the payload
-/// wholesale with a `{truncated, preview, total_chars, output_id, download_url}`
-/// envelope, so every schema carried a second `anyOf` arm to admit it — and
-/// because the cache is per-transport, the published schema depended on how the
-/// server was started.
+/// Replacing an oversized payload wholesale with a
+/// `{truncated, preview, total_chars, output_id, download_url}` envelope would
+/// force every schema to carry a second `anyOf` arm admitting it — and because
+/// the cache is per-transport, that would make the published schema depend on
+/// how the server was started.
 ///
 /// `compact` now trims the payload in place (object keys all survive; only long
 /// strings and long arrays are shortened) and moves the truncation bookkeeping
@@ -566,7 +561,7 @@ fn no_schema_advertises_the_retired_truncation_envelope() {
                 });
             assert!(
                 !advertises_envelope,
-                "{} advertises a truncation envelope the server can no longer produce",
+                "{} advertises a truncation envelope the server does not produce",
                 tool.name
             );
         }
@@ -589,9 +584,8 @@ fn no_schema_advertises_the_retired_truncation_envelope() {
         .contains_key("anyOf"));
 }
 
-// `published_schemas_have_no_dangling_refs` and
-// `published_schemas_do_not_leak_the_schema_dialect_key` used to be here. Both
-// are now `Rule::DanglingRef` / `Rule::NonLocalRef` / `Rule::SchemaDialectLeak`
-// inside `the_shared_tool_surface_contract_holds`, and the kit's version is
-// strictly wider: it walks `inputSchema` for dangling refs too, which this file
-// only ever did for `$schema`.
+// Dangling refs and `$schema` dialect leaks are checked by
+// `Rule::DanglingRef` / `Rule::NonLocalRef` / `Rule::SchemaDialectLeak` inside
+// `the_shared_tool_surface_contract_holds`. The kit walks `inputSchema` for
+// dangling refs as well as `outputSchema`, so there is nothing left for a
+// local version to add.
