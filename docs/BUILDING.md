@@ -3,7 +3,9 @@
 ## Prerequisites
 
 - IDA Pro 9.2, 9.3, or 9.4 with a valid license
-- Rust 1.95+ (set by vibrev-kit, not by this crate)
+- Rust — pinned by `rust-toolchain.toml`; rustup installs it on first use.
+  `Cargo.toml`'s 1.95 floor comes from vibrev-kit and is not separately tested,
+  because the pin means nothing ever builds on it.
 - LLVM/Clang for the C++ bindings
 - The IDA SDK or a local IDA installation matching the selected feature
 

@@ -21,7 +21,8 @@
 ## 前置条件
 
 - 已授权的 IDA Pro 9.2、9.3 或 9.4
-- Rust 1.95+（仅源码构建需要；由 vibrev-kit 决定，不是本 crate 的要求）
+- Rust（仅源码构建需要）—— 版本由 `rust-toolchain.toml` 钉住，rustup 会自动装。
+  `Cargo.toml` 里声明的 1.95 下限来自 vibrev-kit，但真正生效的是那个 pin。
 - 用于 C++ 绑定的 LLVM/Clang（仅源码构建需要）
 
 发行构建从不附带 IDA、SDK 或 IDA 运行时库。你必须在同一平台和架构上已有授权的 IDA 安装。

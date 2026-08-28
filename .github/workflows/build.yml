@@ -34,9 +34,18 @@ jobs:
         shell: pwsh
         run: echo "LIBCLANG_PATH=$((Get-Command clang).Source -replace 'clang.exe')" >> $env:GITHUB_ENV
 
-      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
-        with:
-          components: clippy, rustfmt
+      # No toolchain action: rust-toolchain.toml is the only place the version
+      # is written, and an action that installs one would be a second place for
+      # it to be written differently. rustup ships on every runner and reads the
+      # file; this step just materialises it and puts the resolved version in
+      # the log, so a run can be read back later without guessing.
+      - name: Install the pinned toolchain
+        shell: bash
+        run: |
+          rustup show active-toolchain
+          cargo --version
+          cargo clippy --version
+          cargo fmt --version
 
       # Formatting and the alternate dependency tables are platform-independent,
       # so one runner answers for all three.
@@ -125,7 +134,12 @@ jobs:
         shell: pwsh
         run: echo "LIBCLANG_PATH=$((Get-Command clang).Source -replace 'clang.exe')" >> $env:GITHUB_ENV
 
-      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      # Same pin as `verify`, from the same file. See the note there.
+      - name: Install the pinned toolchain
+        shell: bash
+        run: |
+          rustup show active-toolchain
+          cargo --version
 
       - name: Build SDK-specific binary
         run: >-

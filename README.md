@@ -21,7 +21,9 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/MIGRATION.md](docs/MI
 ## Prerequisites
 
 - IDA Pro 9.2, 9.3, or 9.4 with a valid license
-- Rust 1.95+ (source builds only; set by vibrev-kit, not by this crate)
+- Rust (source builds only) — `rust-toolchain.toml` pins the exact version and
+  rustup installs it for you. `Cargo.toml` declares a 1.95 floor, inherited from
+  vibrev-kit, but the pin is what every build and every CI run actually uses.
 - LLVM/Clang for the C++ bindings (source builds only)
 
 Release builds never ship IDA, the SDK, or IDA runtime libraries. You must already have a licensed IDA install on the same platform and architecture.

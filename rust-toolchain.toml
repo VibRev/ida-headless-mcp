@@ -1,0 +1,15 @@
+# The one place the toolchain version is written.
+#
+# `just check` and the `verify` job run the same commands, but that only makes
+# them the same gate if they run on the same compiler. They did not: a local
+# 1.95 saw no `clippy::result_large_err`, CI's 1.98 did, and the first CI run
+# on this repository failed on a lint no local run could have produced.
+#
+# Pinning trades "new lints arrive on their own" for "green here means green
+# there". Bumping is deliberate: change the channel, run `just check`, fix what
+# the newer clippy found, and commit the two together — so the lints land in a
+# commit that is about them, rather than in whichever unrelated push happened
+# to be first after a release.
+[toolchain]
+channel = "1.98.0"
+components = ["clippy", "rustfmt"]
