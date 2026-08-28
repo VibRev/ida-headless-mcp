@@ -31,7 +31,9 @@ flowchart LR
 - A worker is never shared by two database sessions.
 - `idb_close` optionally saves before releasing the worker and file lock.
 - Worker failure invalidates only its own session.
-- Idle workers have a bounded lifetime; the default is 600 seconds.
+- Idle workers have a bounded lifetime; the default is 600 seconds. A session is
+  reaped only if it is still idle at the moment the close commits, so a call
+  accepted while the reaper was deciding keeps its session.
 
 ## SDK versions
 

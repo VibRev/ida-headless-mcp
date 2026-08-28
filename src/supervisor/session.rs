@@ -476,6 +476,13 @@ impl SessionManager {
             session.lifecycle.lock().await
         };
         ensure_not_cancelled(cancel.as_ref(), native_tool)?;
+        // Waiting for `lifecycle` is where a close happens: the idle reaper and
+        // `idb_close` both hold it while they remove the session. Ask the map
+        // again rather than sending this call to a worker that has been given
+        // back to the pool.
+        if !self.is_current(database, &session).await {
+            return Err(closed_while_waiting(database));
+        }
         // Recorded for `server_health`, which reads these without this lock.
         let active_call = session.begin_call(native_tool);
         *session.last_access.lock().await = Instant::now();
@@ -548,19 +555,49 @@ impl SessionManager {
             let guard = self.sessions.read().await;
             guard.by_id.values().cloned().collect::<Vec<_>>()
         };
-        let mut expired = Vec::new();
         for session in sessions {
-            if session.idle_ttl_sec == 0 || session.active_calls.load(Ordering::Acquire) != 0 {
-                continue;
-            }
-            if session.last_access.lock().await.elapsed()
-                >= Duration::from_secs(session.idle_ttl_sec)
-            {
-                expired.push(session.info.read().await.session_id.clone());
-            }
+            self.close_if_idle(&session).await;
         }
-        for session_id in expired {
-            let _ = self.close(&session_id, true).await;
+    }
+
+    /// Close one session, but only if it is *still* idle when the close can
+    /// actually happen.
+    ///
+    /// The expiry decision and the close have to be one step. Read outside the
+    /// session's `lifecycle` lock, "idle for longer than the TTL" is a claim
+    /// about the past: `call_native_result` takes that same lock before it
+    /// registers a call, so a request can arrive between the reaper's snapshot
+    /// and its close and be answered by a session the reaper has already
+    /// condemned — or be accepted and then have its worker closed underneath
+    /// it. So the decision is made again here, under the lock, against the
+    /// live counters, and the removal is conditional on the map still holding
+    /// this very session.
+    ///
+    /// Deliberately not routed through [`Self::close`]: an explicit `idb_close`
+    /// means close it, and must keep closing a busy session.
+    async fn close_if_idle(&self, session: &Arc<ManagedSession>) {
+        if !session.is_idle_past_ttl().await {
+            return;
+        }
+        let _lifecycle_guard = session.lifecycle.lock().await;
+        // Waiting for that lock can have taken any amount of time, and a call
+        // that held it has just finished touching `last_access`. Ask again.
+        if !session.is_idle_past_ttl().await {
+            return;
+        }
+        let session_id = session.info.read().await.session_id.clone();
+        // `remove_if_current` compares the `Arc`, so a session that was closed
+        // and reopened under the same ID while this task waited cannot have its
+        // replacement reaped by a decision made about its predecessor.
+        if !self.remove_if_current(&session_id, session).await {
+            return;
+        }
+        if let Err(error) = session.worker.close_with_save(true).await {
+            warn!(
+                session_id = %session_id,
+                error = %error,
+                "failed to close an idle database session"
+            );
         }
     }
 
@@ -681,6 +718,12 @@ fn requested_session_id(preferred: Option<&str>) -> Result<String, ToolError> {
     Ok(preferred.to_string())
 }
 
+fn closed_while_waiting(database: &str) -> ToolError {
+    ToolError::IdaError(format!(
+        "Database session '{database}' was closed while this call waited for it. Open it again with idb_open."
+    ))
+}
+
 fn cancelled_before_start(operation: &str) -> ToolError {
     ToolError::Cancelled(format!("cancelled {operation} before it started"))
 }
@@ -717,6 +760,14 @@ impl ManagedSession {
         self.current_call
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Whether this session has an idle TTL, no call registered against it, and
+    /// has gone untouched for at least that long.
+    async fn is_idle_past_ttl(&self) -> bool {
+        self.idle_ttl_sec != 0
+            && self.active_calls.load(Ordering::Acquire) == 0
+            && self.last_access.lock().await.elapsed() >= Duration::from_secs(self.idle_ttl_sec)
     }
 
     async fn health_snapshot(&self) -> SessionHealth {
@@ -831,7 +882,7 @@ mod tests {
     use crate::ida::handlers::warmup::{BUILD_CACHES_STEP, INIT_HEXRAYS_STEP};
     use crate::ida::pool::{WorkerPool, WorkerPoolConfig};
     use crate::ida::types::{WarmupResult, WarmupStep};
-    use serde_json::{json, Value};
+    use serde_json::{json, Map, Value};
     use std::path::PathBuf;
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
@@ -871,6 +922,14 @@ mod tests {
             &self,
             session_id: &str,
         ) -> std::sync::Arc<super::ManagedSession> {
+            self.insert_test_session_with_ttl(session_id, 0).await
+        }
+
+        async fn insert_test_session_with_ttl(
+            &self,
+            session_id: &str,
+            idle_ttl_sec: u64,
+        ) -> std::sync::Arc<super::ManagedSession> {
             let info = test_info();
             let session = std::sync::Arc::new(super::ManagedSession {
                 info: tokio::sync::RwLock::new(SessionInfo {
@@ -882,7 +941,7 @@ mod tests {
                     self.pool.clone(),
                     session_id.to_string(),
                 )),
-                idle_ttl_sec: 0,
+                idle_ttl_sec,
                 last_access: tokio::sync::Mutex::new(Instant::now()),
                 active_calls: std::sync::atomic::AtomicUsize::new(0),
                 current_call: std::sync::Mutex::new(None),
@@ -893,6 +952,26 @@ mod tests {
                 .by_id
                 .insert(session_id.to_string(), session.clone());
             session
+        }
+    }
+
+    impl super::ManagedSession {
+        /// Backdate `last_access` past any TTL these tests use, so idleness is
+        /// a fact about the session rather than about how long the test slept.
+        async fn expire_for_test(&self) {
+            let expired = Instant::now()
+                .checked_sub(Duration::from_secs(60))
+                .expect("the monotonic clock must reach a minute back");
+            *self.last_access.lock().await = expired;
+        }
+    }
+
+    /// Let a spawned task run until it parks. These tests use the default
+    /// current-thread runtime, so nothing else can be running while this
+    /// yields, and the task is either finished or blocked when it returns.
+    async fn let_the_other_task_reach_its_wait() {
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
         }
     }
 
@@ -936,6 +1015,114 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("no/such/sample.i64"), "{message}");
         assert!(!message.contains("/isolated/home"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn an_idle_session_past_its_ttl_is_reaped() {
+        let manager = SessionManager::new(test_pool());
+        let session = manager.insert_test_session_with_ttl("sess-1", 1).await;
+        session.expire_for_test().await;
+
+        manager.reap_idle().await;
+
+        assert!(
+            manager.get("sess-1").await.is_err(),
+            "an expired session with no call in flight must be reaped"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_within_its_ttl_survives_the_reaper() {
+        let manager = SessionManager::new(test_pool());
+        manager.insert_test_session_with_ttl("sess-1", 600).await;
+
+        manager.reap_idle().await;
+
+        assert!(manager.get("sess-1").await.is_ok());
+    }
+
+    /// The race this closes: the reaper decided a session was expired from an
+    /// unlocked snapshot, and a call could be accepted before the close it had
+    /// already committed to.
+    #[tokio::test]
+    async fn a_call_that_starts_before_the_close_commits_keeps_its_session() {
+        let manager = SessionManager::new(test_pool());
+        let session = manager.insert_test_session_with_ttl("sess-1", 1).await;
+        session.expire_for_test().await;
+
+        // Stand in for a call that has entered `call_native_result` and holds
+        // `lifecycle`, but has not yet registered itself in `active_calls`.
+        let lifecycle = session.lifecycle.lock().await;
+        let reaper = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.reap_idle().await }
+        });
+        let_the_other_task_reach_its_wait().await;
+        assert!(
+            manager.get("sess-1").await.is_ok(),
+            "the reaper must not close a session out from under the lifecycle lock"
+        );
+
+        let _active = session.begin_call("decompile");
+        drop(lifecycle);
+        reaper.await.expect("the reaper task");
+
+        assert!(
+            manager.get("sess-1").await.is_ok(),
+            "a call registered while the reaper waited must keep its session alive"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_reaper_cannot_close_a_replacement_session() {
+        let manager = SessionManager::new(test_pool());
+        let expired = manager.insert_test_session_with_ttl("sess-1", 1).await;
+        expired.expire_for_test().await;
+        // Closed and reopened under the same ID while the reaper still held a
+        // reference to its predecessor.
+        let replacement = manager.insert_test_session_with_ttl("sess-1", 600).await;
+
+        manager.close_if_idle(&expired).await;
+
+        let current = manager
+            .get("sess-1")
+            .await
+            .expect("the replacement session must survive");
+        assert!(
+            std::sync::Arc::ptr_eq(&current, &replacement),
+            "a decision about one session must not close another"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_call_that_waited_through_a_close_is_told_the_session_closed() {
+        let manager = SessionManager::new(test_pool());
+        let session = manager.insert_test_session("sess-1").await;
+
+        let lifecycle = session.lifecycle.lock().await;
+        let call = tokio::spawn({
+            let manager = manager.clone();
+            async move {
+                manager
+                    .call_native_result("sess-1", "analysis_status", Map::new(), None)
+                    .await
+            }
+        });
+        let_the_other_task_reach_its_wait().await;
+
+        // The close commits while the call is queued behind the lifecycle lock.
+        manager.remove_if_current("sess-1", &session).await;
+        drop(lifecycle);
+
+        let error = call
+            .await
+            .expect("the call task")
+            .expect_err("a closed session cannot answer");
+        let message = error.to_string();
+        assert!(
+            message.contains("was closed while this call waited"),
+            "{message}"
+        );
     }
 
     #[test]
