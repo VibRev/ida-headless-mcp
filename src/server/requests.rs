@@ -7,8 +7,9 @@ use super::parse::{page_bounds, parse_optional_unsigned};
 use crate::error::ToolError;
 use crate::ida::handlers::signature::SignatureRequest;
 use crate::ida::query::{
-    FunctionQuery, FunctionSort, NameQuery, NameSort, StringQuery, StringSearch, StringSort,
-    TypeKind, TypeQuery, TypeSort, XrefKind,
+    DscDepsQuery, DscImageQuery, DscStringScope, DscStringSearch, DscSymbolSearch, FunctionQuery,
+    FunctionSort, NameQuery, NameSort, StringQuery, StringSearch, StringSort, TypeKind, TypeQuery,
+    TypeSort, XrefKind,
 };
 use crate::ida::scan::{InsnScanRequest, ScanScope, ScopeSpec, DEFAULT_MAX_SCAN};
 use crate::ida::signature::SignatureFormat;
@@ -1798,6 +1799,228 @@ pub struct DscAddRegionRequest {
     #[serde(alias = "ea", alias = "addr")]
     pub address: AddressArg,
     #[schemars(description = "Timeout in seconds (default 300, max 600).")]
+    #[schemars(range(min = 0, max = 600))]
+    pub timeout_secs: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DscListImagesRequest {
+    #[schemars(
+        description = "Keep only images whose path contains this text (case-folded substring)."
+    )]
+    #[serde(alias = "query")]
+    pub filter: Option<String>,
+    #[schemars(
+        description = "Keep only images whose path matches this regular expression. Name at \
+                       most one of 'filter' and 'regex'."
+    )]
+    pub regex: Option<String>,
+    #[schemars(
+        description = "Keep only images already mapped into the database (default false). A \
+                       freshly opened DSC has none: the loader maps the header only."
+    )]
+    pub loaded_only: Option<bool>,
+    #[schemars(description = "Offset for pagination (default 0).")]
+    #[schemars(range(min = 0))]
+    pub offset: Option<i64>,
+    #[schemars(description = "Maximum images to return (1-10000, default 100).")]
+    #[serde(alias = "count")]
+    #[schemars(range(min = 0, max = 10000))]
+    pub limit: Option<i64>,
+    #[schemars(description = "Timeout in seconds (default 120, max 600).")]
+    #[schemars(range(min = 0, max = 600))]
+    pub timeout_secs: Option<i64>,
+}
+
+impl DscListImagesRequest {
+    pub fn resolve_query(&self) -> Result<DscImageQuery, ToolError> {
+        let (offset, limit) = page_bounds(self.offset, self.limit, 100, 10_000)?;
+        Ok(DscImageQuery {
+            offset,
+            limit,
+            filter: crate::non_empty_trimmed(self.filter.as_deref()).map(str::to_string),
+            regex: crate::non_empty_trimmed(self.regex.as_deref()).map(str::to_string),
+            loaded_only: self.loaded_only.unwrap_or(false),
+        })
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DscImageDepsRequest {
+    #[schemars(
+        description = "DSC-internal dylib path (absolute, e.g. '/usr/lib/libSystem.B.dylib')."
+    )]
+    pub module: String,
+    #[schemars(
+        description = "Recursion depth: 1 = direct dependencies only (default), -1 = the whole \
+                       transitive closure."
+    )]
+    #[schemars(range(min = -1, max = 64))]
+    pub depth: Option<i64>,
+    #[schemars(description = "Offset for pagination (default 0).")]
+    #[schemars(range(min = 0))]
+    pub offset: Option<i64>,
+    #[schemars(description = "Maximum images to return (1-10000, default 100).")]
+    #[serde(alias = "count")]
+    #[schemars(range(min = 0, max = 10000))]
+    pub limit: Option<i64>,
+    #[schemars(description = "Timeout in seconds (default 120, max 600).")]
+    #[schemars(range(min = 0, max = 600))]
+    pub timeout_secs: Option<i64>,
+}
+
+impl DscImageDepsRequest {
+    pub fn resolve_query(&self) -> Result<DscDepsQuery, ToolError> {
+        let (offset, limit) = page_bounds(self.offset, self.limit, 100, 10_000)?;
+        // -1 is a sentinel for "unlimited", so this one cannot go through
+        // parse_optional_unsigned. The schema pins the rest of the range.
+        let depth = match self.depth {
+            None => 1,
+            Some(depth) if (-1..=64).contains(&depth) => depth as i32,
+            Some(depth) => {
+                return Err(ToolError::InvalidParams(format!(
+                    "depth must be -1 (unlimited) or 0..=64, got {depth}"
+                )));
+            }
+        };
+        Ok(DscDepsQuery {
+            offset,
+            limit,
+            module: self.module.trim().to_string(),
+            depth,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DscFindSymbolsRequest {
+    #[schemars(description = "Substring to look for in symbol names. Must not be empty.")]
+    #[serde(alias = "query", alias = "name")]
+    pub needle: String,
+    #[schemars(
+        description = "Skip the export tables of images that are not mapped in yet (default \
+                       false, i.e. search the whole cache)."
+    )]
+    pub loaded_images_only: Option<bool>,
+    #[schemars(description = "Match case-insensitively (default false).")]
+    pub case_insensitive: Option<bool>,
+    #[schemars(description = "Offset for pagination (default 0).")]
+    #[schemars(range(min = 0))]
+    pub offset: Option<i64>,
+    #[schemars(description = "Maximum matches to return (1-1000, default 100).")]
+    #[serde(alias = "count")]
+    #[schemars(range(min = 0, max = 1000))]
+    pub limit: Option<i64>,
+    #[schemars(description = "Timeout in seconds (default 120, max 600).")]
+    #[schemars(range(min = 0, max = 600))]
+    pub timeout_secs: Option<i64>,
+}
+
+/// A search needle IDA can take: non-empty, and free of the interior NUL that
+/// would fail the C-string conversion inside idalib.
+///
+/// The NUL check belongs here and not in the handler. idalib reports that
+/// conversion failure exactly the way it reports "nothing matched", and the
+/// handler reads the latter as an empty result — so a needle that could only
+/// ever fail has to be turned away before it reaches that reading.
+fn dsc_needle(raw: &str) -> Result<String, ToolError> {
+    let needle = raw.trim().to_string();
+    if needle.is_empty() {
+        return Err(ToolError::InvalidParams(
+            "needle must not be empty".to_string(),
+        ));
+    }
+    if needle.contains('\0') {
+        return Err(ToolError::InvalidParams(
+            "needle must not contain a NUL character".to_string(),
+        ));
+    }
+    Ok(needle)
+}
+
+impl DscFindSymbolsRequest {
+    pub fn resolve_search(&self) -> Result<DscSymbolSearch, ToolError> {
+        let needle = dsc_needle(&self.needle)?;
+        let (offset, limit) = page_bounds(self.offset, self.limit, 100, 1_000)?;
+        Ok(DscSymbolSearch {
+            offset,
+            limit,
+            needle,
+            loaded_images_only: self.loaded_images_only.unwrap_or(false),
+            case_insensitive: self.case_insensitive.unwrap_or(false),
+        })
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DscFindStringsRequest {
+    #[schemars(description = "Substring to look for in the cache's bytes. Must not be empty.")]
+    #[serde(alias = "query", alias = "content")]
+    pub needle: String,
+    #[schemars(
+        description = "Where to scan: 'images' (default) reads the images' own contents, \
+                       'files' reads whole cache files including bytes no image claims."
+    )]
+    #[serde(default, deserialize_with = "lenient_enum")]
+    pub scope: Option<DscStringScope>,
+    #[schemars(
+        description = "Under scope='images': scan every section, not just data sections \
+                       (default false). Ignored when scope='files'."
+    )]
+    pub all_sections: Option<bool>,
+    #[schemars(
+        description = "Under scope='files': also scan the '.symbols' pool (default false). \
+                       Ignored when scope='images'."
+    )]
+    pub include_symbols: Option<bool>,
+    #[schemars(
+        description = "Under scope='files': also scan branch-mapping files (default false). \
+                       Ignored when scope='images'."
+    )]
+    pub include_branch_mappings: Option<bool>,
+    #[schemars(
+        description = "Under scope='files': also scan other adjacent files (default false). \
+                       Ignored when scope='images'."
+    )]
+    pub include_other: Option<bool>,
+    #[schemars(description = "Match case-insensitively (default false).")]
+    pub case_insensitive: Option<bool>,
+    #[schemars(description = "Offset for pagination (default 0).")]
+    #[schemars(range(min = 0))]
+    pub offset: Option<i64>,
+    #[schemars(description = "Maximum matches to return (1-1000, default 100).")]
+    #[serde(alias = "count")]
+    #[schemars(range(min = 0, max = 1000))]
+    pub limit: Option<i64>,
+    #[schemars(description = "Timeout in seconds (default 120, max 600).")]
+    #[schemars(range(min = 0, max = 600))]
+    pub timeout_secs: Option<i64>,
+}
+
+impl DscFindStringsRequest {
+    pub fn resolve_search(&self) -> Result<DscStringSearch, ToolError> {
+        let needle = dsc_needle(&self.needle)?;
+        let (offset, limit) = page_bounds(self.offset, self.limit, 100, 1_000)?;
+        Ok(DscStringSearch {
+            offset,
+            limit,
+            needle,
+            scope: self.scope.unwrap_or_default(),
+            all_sections: self.all_sections.unwrap_or(false),
+            include_symbols: self.include_symbols.unwrap_or(false),
+            include_branch_mappings: self.include_branch_mappings.unwrap_or(false),
+            include_other: self.include_other.unwrap_or(false),
+            case_insensitive: self.case_insensitive.unwrap_or(false),
+        })
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DscRegionAtRequest {
+    #[schemars(description = "Single address to resolve (hex '0x...' or decimal).")]
+    #[serde(alias = "ea", alias = "addr")]
+    pub address: AddressArg,
+    #[schemars(description = "Timeout in seconds (default 120, max 600).")]
     #[schemars(range(min = 0, max = 600))]
     pub timeout_secs: Option<i64>,
 }

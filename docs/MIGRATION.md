@@ -13,8 +13,8 @@ implements, with the schemas generated from its own request types.
 
 ## What changed
 
-- The public surface is the native `#[tool]` catalog: **85 tools** by default,
-  86 with `--unsafe` (was 66 / 69).
+- The public surface is the native `#[tool]` catalog: **90 tools** by default,
+  91 with `--unsafe` (was 66 / 69).
 - Every analysis tool still takes `database`, still returned by `idb_open`.
 - Database lifecycle is still supervisor-owned. The worker-local `open_idb`,
   `open_dsc` and `close_idb` are not routable; use `idb_open` / `idb_close`.

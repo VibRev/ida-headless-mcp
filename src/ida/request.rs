@@ -5,7 +5,8 @@ use crate::ida::handlers::signature::SignatureRequest;
 use crate::ida::int_spec::IntSpec;
 use crate::ida::observability::ProgressSender;
 use crate::ida::query::{
-    FunctionQuery, NameQuery, StringQuery, StringSearch, TypeQuery, XrefQuery,
+    DscDepsQuery, DscImageQuery, DscStringSearch, DscSymbolSearch, FunctionQuery, NameQuery,
+    StringQuery, StringSearch, TypeQuery, XrefQuery,
 };
 use crate::ida::scan::{InsnScanRequest, ScanScope};
 use crate::ida::types::*;
@@ -120,6 +121,29 @@ pub enum IdaRequest {
     DscLoadRegion {
         addr: u64,
         resp: oneshot::Sender<Result<DscRegionInfo, ToolError>>,
+    },
+    // The five below only read the dscu service, so none of them carries an
+    // `expected_generation`: that guard exists to stop a stale task writing into
+    // a database it no longer owns, and a query writes nothing.
+    DscImages {
+        query: DscImageQuery,
+        resp: oneshot::Sender<Result<DscImageList, ToolError>>,
+    },
+    DscImageDeps {
+        query: DscDepsQuery,
+        resp: oneshot::Sender<Result<DscImageDeps, ToolError>>,
+    },
+    DscFindSymbols {
+        search: DscSymbolSearch,
+        resp: oneshot::Sender<Result<DscSymbolMatches, ToolError>>,
+    },
+    DscFindStrings {
+        search: DscStringSearch,
+        resp: oneshot::Sender<Result<DscStringMatches, ToolError>>,
+    },
+    DscRegionAt {
+        addr: u64,
+        resp: oneshot::Sender<Result<DscRegionQuery, ToolError>>,
     },
     ListFunctions {
         query: FunctionQuery,

@@ -5,7 +5,8 @@ use crate::ida::handlers::signature::SignatureRequest;
 use crate::ida::int_spec::IntSpec;
 use crate::ida::observability::ProgressSender;
 use crate::ida::query::{
-    FunctionQuery, NameQuery, StringQuery, StringSearch, TypeQuery, XrefQuery,
+    DscDepsQuery, DscImageQuery, DscStringSearch, DscSymbolSearch, FunctionQuery, NameQuery,
+    StringQuery, StringSearch, TypeQuery, XrefQuery,
 };
 use crate::ida::request::{IdaRequest, SdkMutation};
 use crate::ida::scan::{InsnScanRequest, ScanScope};
@@ -375,6 +376,61 @@ impl IdaWorker {
     ) -> Result<DscRegionInfo, ToolError> {
         let (tx, rx) = oneshot::channel();
         self.try_send(IdaRequest::DscLoadRegion { addr, resp: tx })?;
+        Self::recv_with_timeout(rx, timeout_secs).await
+    }
+
+    /// List the images in the open shared cache, with pagination.
+    pub async fn dsc_images(
+        &self,
+        query: DscImageQuery,
+        timeout_secs: Option<u64>,
+    ) -> Result<DscImageList, ToolError> {
+        let (tx, rx) = oneshot::channel();
+        self.try_send(IdaRequest::DscImages { query, resp: tx })?;
+        Self::recv_with_timeout(rx, timeout_secs).await
+    }
+
+    /// Resolve an image's dependency closure.
+    pub async fn dsc_image_deps(
+        &self,
+        query: DscDepsQuery,
+        timeout_secs: Option<u64>,
+    ) -> Result<DscImageDeps, ToolError> {
+        let (tx, rx) = oneshot::channel();
+        self.try_send(IdaRequest::DscImageDeps { query, resp: tx })?;
+        Self::recv_with_timeout(rx, timeout_secs).await
+    }
+
+    /// Search the cache's symbol tables and image export tables.
+    pub async fn dsc_find_symbols(
+        &self,
+        search: DscSymbolSearch,
+        timeout_secs: Option<u64>,
+    ) -> Result<DscSymbolMatches, ToolError> {
+        let (tx, rx) = oneshot::channel();
+        self.try_send(IdaRequest::DscFindSymbols { search, resp: tx })?;
+        Self::recv_with_timeout(rx, timeout_secs).await
+    }
+
+    /// Search the cache's byte content for a string.
+    pub async fn dsc_find_strings(
+        &self,
+        search: DscStringSearch,
+        timeout_secs: Option<u64>,
+    ) -> Result<DscStringMatches, ToolError> {
+        let (tx, rx) = oneshot::channel();
+        self.try_send(IdaRequest::DscFindStrings { search, resp: tx })?;
+        Self::recv_with_timeout(rx, timeout_secs).await
+    }
+
+    /// Resolve an address to its cache region without mapping anything.
+    pub async fn dsc_region_at(
+        &self,
+        addr: u64,
+        timeout_secs: Option<u64>,
+    ) -> Result<DscRegionQuery, ToolError> {
+        let (tx, rx) = oneshot::channel();
+        self.try_send(IdaRequest::DscRegionAt { addr, resp: tx })?;
         Self::recv_with_timeout(rx, timeout_secs).await
     }
 

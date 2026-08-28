@@ -830,6 +830,60 @@ test-dsc dsc_path=dsc_test_path:
     seg_before=$(echo "$seg_text" | jq -r 'if type == "array" then length else .segments | length end // 0')
     echo "   segments OK — count=$seg_before"
 
+    # Phase 3b: the read-only probes. A DSC opens with the header only, so
+    # these are what a caller uses to find a dylib worth loading; they must
+    # answer before anything is mapped in.
+    send '{"jsonrpc":"2.0","id":110,"method":"tools/call","params":{"name":"dsc_list_images","arguments":{"filter":"libSystem.B","limit":10}}}'
+    img_resp=$(wait_response 110 60)
+    img_error=$(echo "$img_resp" | jq -r '.result.isError // false')
+    if [ "$img_error" = "true" ]; then
+        echo "❌ dsc_list_images failed:"
+        echo "$img_resp" | jq -r '.result.content[0].text // empty'
+        cat "$log"
+        exit 1
+    fi
+    img_text=$(echo "$img_resp" | jq -r '.result.content[0].text // empty')
+    img_total=$(echo "$img_text" | jq -r '.total // 0')
+    if [ "$img_total" -gt 0 ]; then
+        echo "   dsc_list_images OK — $img_total match(es) for 'libSystem.B'"
+    else
+        echo "❌ dsc_list_images found no image matching 'libSystem.B'"
+        cat "$log"
+        exit 1
+    fi
+
+    # A cache with no images mapped must still answer symbol queries: IDA reads
+    # the export tables, not the database.
+    send '{"jsonrpc":"2.0","id":111,"method":"tools/call","params":{"name":"dsc_find_symbols","arguments":{"needle":"malloc","limit":5}}}'
+    sym_resp=$(wait_response 111 120)
+    sym_error=$(echo "$sym_resp" | jq -r '.result.isError // false')
+    if [ "$sym_error" = "true" ]; then
+        echo "❌ dsc_find_symbols failed:"
+        echo "$sym_resp" | jq -r '.result.content[0].text // empty'
+        cat "$log"
+        exit 1
+    fi
+    sym_count=$(echo "$sym_resp" | jq -r '.result.content[0].text // empty' | jq -r '.matches | length')
+    echo "   dsc_find_symbols OK — $sym_count match(es) for 'malloc'"
+
+    # "No match" must be an empty list, not an error: idalib reports IDA's
+    # "nothing found" as an Err, and the handler is what turns it back.
+    send '{"jsonrpc":"2.0","id":112,"method":"tools/call","params":{"name":"dsc_find_symbols","arguments":{"needle":"zzz_no_such_symbol_zzz","limit":5}}}'
+    miss_resp=$(wait_response 112 120)
+    miss_error=$(echo "$miss_resp" | jq -r '.result.isError // false')
+    if [ "$miss_error" = "true" ]; then
+        echo "❌ dsc_find_symbols reported a miss as an error:"
+        echo "$miss_resp" | jq -r '.result.content[0].text // empty'
+        cat "$log"
+        exit 1
+    fi
+    miss_count=$(echo "$miss_resp" | jq -r '.result.content[0].text // empty' | jq -r '.matches | length')
+    if [ "$miss_count" = "0" ]; then
+        echo "   dsc_find_symbols OK — a miss is an empty list, not an error"
+    else
+        echo "⚠️  dsc_find_symbols matched $miss_count on a needle that should miss"
+    fi
+
     # Phase 4: dsc_add_dylib — load an additional framework
     send '{"jsonrpc":"2.0","id":102,"method":"tools/call","params":{"name":"dsc_add_dylib","arguments":{"module":"/usr/lib/libSystem.B.dylib","timeout_secs":300}}}'
     add_resp=$(wait_response 102 300)
@@ -878,6 +932,34 @@ test-dsc dsc_path=dsc_test_path:
         # Reused database: the dylib usually persisted from an earlier run,
         # so an idempotent re-add legitimately changes nothing.
         echo "   segment count unchanged ($seg_before) — module already loaded in the reused database"
+    fi
+
+    # Phase 5b: the probes must now agree that the dylib is mapped, and must
+    # be able to name the region its header sits in.
+    send '{"jsonrpc":"2.0","id":113,"method":"tools/call","params":{"name":"dsc_list_images","arguments":{"filter":"libSystem.B","loaded_only":true,"limit":10}}}'
+    loaded_resp=$(wait_response 113 60)
+    loaded_total=$(echo "$loaded_resp" | jq -r '.result.content[0].text // empty' | jq -r '.total // 0')
+    if [ "$loaded_total" -gt 0 ]; then
+        echo "   ✓ dsc_list_images(loaded_only) sees the dylib the add mapped"
+    else
+        echo "❌ dsc_list_images(loaded_only) does not see the dylib dsc_add_dylib reported loading"
+        cat "$log"
+        exit 1
+    fi
+
+    img_addr=$(echo "$img_text" | jq -r '.images[0].address_value // empty')
+    if [ -n "$img_addr" ]; then
+        send "$(printf '{"jsonrpc":"2.0","id":114,"method":"tools/call","params":{"name":"dsc_region_at","arguments":{"address":%s}}}' "$img_addr")"
+        region_resp=$(wait_response 114 60)
+        region_error=$(echo "$region_resp" | jq -r '.result.isError // false')
+        if [ "$region_error" = "true" ]; then
+            echo "❌ dsc_region_at failed on an address dsc_list_images reported:"
+            echo "$region_resp" | jq -r '.result.content[0].text // empty'
+            cat "$log"
+            exit 1
+        fi
+        region_kind=$(echo "$region_resp" | jq -r '.result.content[0].text // empty' | jq -r '.kind // empty')
+        echo "   dsc_region_at OK — kind=$region_kind"
     fi
 
     # Phase 6: analysis_status sanity check

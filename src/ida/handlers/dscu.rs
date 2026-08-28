@@ -1,8 +1,17 @@
 //! Native IDA 9.4 dyld_shared_cache helpers.
 
 use crate::error::ToolError;
-use crate::ida::types::{DscImageInfo, DscRegionInfo};
+use crate::ida::query::{DscDepsQuery, DscImageQuery, DscStringSearch, DscSymbolSearch};
+use crate::ida::types::{
+    DscImageDeps, DscImageInfo, DscImageList, DscRegionInfo, DscRegionQuery, DscStringMatches,
+    DscSymbolMatches,
+};
 use idalib::IDB;
+
+#[cfg(feature = "ida-94")]
+use crate::ida::query::{dsc_paginate, dsc_scan_count, DscStringScope};
+#[cfg(feature = "ida-94")]
+use crate::ida::types::{DscStringMatch, DscSymbolMatch};
 
 #[cfg(feature = "ida-94")]
 fn require_dscu(idb: &Option<IDB>) -> Result<(), ToolError> {
@@ -80,6 +89,188 @@ pub fn handle_dsc_load_region(idb: &Option<IDB>, ea: u64) -> Result<DscRegionInf
         .map_err(ToolError::from)
 }
 
+#[cfg(feature = "ida-94")]
+fn symbol_flags(search: &DscSymbolSearch) -> u32 {
+    use idalib::dscu::symbol_flags as bits;
+    let mut flags = 0;
+    if search.loaded_images_only {
+        flags |= bits::LOADED_IMAGES_ONLY;
+    }
+    if search.case_insensitive {
+        flags |= bits::CASE_INSENSITIVE;
+    }
+    flags
+}
+
+/// Translate the scope and its knobs into `FSSF_*`.
+///
+/// The two scopes take disjoint knobs, so each arm sets only its own: passing
+/// `FILES_INCLUDE_*` under the images scope would be meaningless, not additive.
+#[cfg(feature = "ida-94")]
+fn string_flags(search: &DscStringSearch) -> u32 {
+    use idalib::dscu::string_flags as bits;
+    let mut flags = match search.scope {
+        DscStringScope::Images => bits::SCOPE_IMAGES,
+        DscStringScope::Files => bits::SCOPE_FILES,
+    };
+    match search.scope {
+        DscStringScope::Images => {
+            if search.all_sections {
+                flags |= bits::IMAGES_SCOPE_ALL;
+            }
+        }
+        DscStringScope::Files => {
+            if search.include_symbols {
+                flags |= bits::FILES_INCLUDE_SYMBOLS;
+            }
+            if search.include_branch_mappings {
+                flags |= bits::FILES_INCLUDE_BRANCH_MAPPINGS;
+            }
+            if search.include_other {
+                flags |= bits::FILES_INCLUDE_OTHER;
+            }
+        }
+    }
+    if search.case_insensitive {
+        flags |= bits::CASE_INSENSITIVE;
+    }
+    flags
+}
+
+#[cfg(feature = "ida-94")]
+fn symbol_match(value: idalib::dscu::SymbolMatch) -> DscSymbolMatch {
+    DscSymbolMatch {
+        symbol: value.symbol,
+        address: hex_addr(value.address),
+        address_value: value.address,
+        image_index: value.image_index,
+        // -1 is the cache's own .symbols table, which has no image to name.
+        image_name: (value.image_index >= 0)
+            .then(|| idalib::dscu::image_info(value.image_index))
+            .flatten()
+            .map(|info| info.name),
+    }
+}
+
+#[cfg(feature = "ida-94")]
+fn string_match(value: idalib::dscu::StringMatch) -> DscStringMatch {
+    DscStringMatch {
+        address: hex_addr(value.address),
+        address_value: value.address,
+        image_index: value.image_index,
+        file_index: value.file_index,
+        file_offset: value.file_offset,
+        context: value.context,
+    }
+}
+
+#[cfg(feature = "ida-94")]
+pub fn handle_dsc_images(
+    idb: &Option<IDB>,
+    query: &DscImageQuery,
+) -> Result<DscImageList, ToolError> {
+    require_dscu(idb)?;
+    let filter = query.name_filter()?;
+    let matched: Vec<DscImageInfo> = idalib::dscu::images()
+        .map_err(ToolError::from)?
+        .into_iter()
+        .filter(|image| !query.loaded_only || image.loaded)
+        .filter(|image| filter.matches(&image.name))
+        .map(image_info)
+        .collect();
+    let total = matched.len();
+    let (images, next_offset) = dsc_paginate(matched, query.offset, query.limit);
+    Ok(DscImageList {
+        images,
+        total,
+        next_offset,
+        input_file_path: idalib::dscu::input_file_path(),
+    })
+}
+
+#[cfg(feature = "ida-94")]
+pub fn handle_dsc_image_deps(
+    idb: &Option<IDB>,
+    query: &DscDepsQuery,
+) -> Result<DscImageDeps, ToolError> {
+    require_dscu(idb)?;
+    let Some(index) = idalib::dscu::image_index(&query.module).map_err(ToolError::from)? else {
+        return Err(ToolError::InvalidParams(format!(
+            "DSC image not found: {}",
+            query.module
+        )));
+    };
+    let all: Vec<DscImageInfo> = idalib::dscu::image_dependencies(index, query.depth)
+        .map_err(ToolError::from)?
+        .into_iter()
+        .map(image_info)
+        .collect();
+    let total = all.len();
+    let (images, next_offset) = dsc_paginate(all, query.offset, query.limit);
+    Ok(DscImageDeps {
+        images,
+        total,
+        next_offset,
+        module: query.module.clone(),
+        depth: query.depth,
+    })
+}
+
+#[cfg(feature = "ida-94")]
+pub fn handle_dsc_find_symbols(
+    idb: &Option<IDB>,
+    search: &DscSymbolSearch,
+) -> Result<DscSymbolMatches, ToolError> {
+    require_dscu(idb)?;
+    let scan = dsc_scan_count(search.offset, search.limit);
+    // IDA answers "nothing matched" with a false return rather than a failure
+    // (dscu.h: "return true if at least one symbol was found"), and idalib maps
+    // that false onto an Err. require_dscu has already proved the service is
+    // there, so an Err here is an empty result, not a broken query.
+    let found = idalib::dscu::find_symbols(&search.needle, symbol_flags(search), Some(scan))
+        .unwrap_or_default();
+    let (page, next_offset) = dsc_paginate(found, search.offset, search.limit);
+    Ok(DscSymbolMatches {
+        matches: page.into_iter().map(symbol_match).collect(),
+        next_offset,
+    })
+}
+
+#[cfg(feature = "ida-94")]
+pub fn handle_dsc_find_strings(
+    idb: &Option<IDB>,
+    search: &DscStringSearch,
+) -> Result<DscStringMatches, ToolError> {
+    require_dscu(idb)?;
+    let scan = dsc_scan_count(search.offset, search.limit);
+    // Same "false means empty" contract as handle_dsc_find_symbols.
+    let found = idalib::dscu::find_strings(&search.needle, string_flags(search), Some(scan))
+        .unwrap_or_default();
+    let (page, next_offset) = dsc_paginate(found, search.offset, search.limit);
+    Ok(DscStringMatches {
+        matches: page.into_iter().map(string_match).collect(),
+        next_offset,
+    })
+}
+
+/// Resolve an address to its region without mapping anything.
+///
+/// Returns [`DscRegionQuery`] rather than [`DscRegionInfo`]: idalib's query path
+/// hardcodes `loaded` to false, so that field would be noise here.
+#[cfg(feature = "ida-94")]
+pub fn handle_dsc_region_at(idb: &Option<IDB>, ea: u64) -> Result<DscRegionQuery, ToolError> {
+    require_dscu(idb)?;
+    let info = idalib::dscu::region_by_ea(ea).map_err(ToolError::from)?;
+    Ok(DscRegionQuery {
+        start: hex_addr(info.start),
+        start_value: info.start,
+        size: info.size,
+        kind: region_kind(info.kind),
+        image_index: info.image_index,
+        name: info.name,
+    })
+}
+
 #[cfg(not(feature = "ida-94"))]
 pub fn handle_dsc_load_image(idb: &Option<IDB>, _module: &str) -> Result<DscImageInfo, ToolError> {
     idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
@@ -93,5 +284,62 @@ pub fn handle_dsc_load_region(idb: &Option<IDB>, _ea: u64) -> Result<DscRegionIn
     idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
     Err(ToolError::NotSupported(
         "Native DSC region loading requires an IDA 9.4 build".to_string(),
+    ))
+}
+
+// The queries below read `dscu_svc_t`, which the 9.2 and 9.3 SDKs do not ship
+// at all — no dscu.h, no get_dscu_svc(). Those builds can still drive a DSC
+// through the legacy `$ dscu` netnode path (see crate::dsc), but not through
+// this service, so the honest answer is NotSupported rather than an empty list.
+
+#[cfg(not(feature = "ida-94"))]
+pub fn handle_dsc_images(
+    idb: &Option<IDB>,
+    _query: &DscImageQuery,
+) -> Result<DscImageList, ToolError> {
+    idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
+    Err(ToolError::NotSupported(
+        "Listing DSC images requires an IDA 9.4 build".to_string(),
+    ))
+}
+
+#[cfg(not(feature = "ida-94"))]
+pub fn handle_dsc_image_deps(
+    idb: &Option<IDB>,
+    _query: &DscDepsQuery,
+) -> Result<DscImageDeps, ToolError> {
+    idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
+    Err(ToolError::NotSupported(
+        "Querying DSC image dependencies requires an IDA 9.4 build".to_string(),
+    ))
+}
+
+#[cfg(not(feature = "ida-94"))]
+pub fn handle_dsc_find_symbols(
+    idb: &Option<IDB>,
+    _search: &DscSymbolSearch,
+) -> Result<DscSymbolMatches, ToolError> {
+    idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
+    Err(ToolError::NotSupported(
+        "Searching DSC symbols requires an IDA 9.4 build".to_string(),
+    ))
+}
+
+#[cfg(not(feature = "ida-94"))]
+pub fn handle_dsc_find_strings(
+    idb: &Option<IDB>,
+    _search: &DscStringSearch,
+) -> Result<DscStringMatches, ToolError> {
+    idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
+    Err(ToolError::NotSupported(
+        "Searching DSC strings requires an IDA 9.4 build".to_string(),
+    ))
+}
+
+#[cfg(not(feature = "ida-94"))]
+pub fn handle_dsc_region_at(idb: &Option<IDB>, _ea: u64) -> Result<DscRegionQuery, ToolError> {
+    idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
+    Err(ToolError::NotSupported(
+        "Resolving a DSC region requires an IDA 9.4 build".to_string(),
     ))
 }

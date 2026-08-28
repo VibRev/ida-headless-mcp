@@ -128,10 +128,14 @@ impl FromStr for ToolCategory {
 /// Keep this exhaustive: `every_native_tool_has_a_category` enforces it.
 pub fn category_of(name: &str) -> Option<ToolCategory> {
     Some(match name {
-        // Core
+        // Core. The dsc_* family stays together here, search and lookup
+        // included: a shared cache opens with nothing mapped, so a caller who
+        // narrowed to this toolset and could load images but not find them
+        // would be left guessing dylib paths.
         "analysis_status" | "analyze_funcs" | "close_idb" | "dsc_add_dylib" | "dsc_add_region"
-        | "idb_meta" | "load_debug_info" | "open_dsc" | "open_idb" | "recent_operations"
-        | "task_status" | "tool_catalog" | "tool_help" => ToolCategory::Core,
+        | "dsc_find_strings" | "dsc_find_symbols" | "dsc_image_deps" | "dsc_list_images"
+        | "dsc_region_at" | "idb_meta" | "load_debug_info" | "open_dsc" | "open_idb"
+        | "recent_operations" | "task_status" | "tool_catalog" | "tool_help" => ToolCategory::Core,
         // Functions
         "analyze_component" | "analyze_function" | "func_profile" | "function_at"
         | "list_funcs" | "list_functions" | "lookup_funcs" | "resolve_function" => {

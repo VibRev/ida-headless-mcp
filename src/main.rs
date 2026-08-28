@@ -1348,7 +1348,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(checked, 368, "the parameter population changed");
+        assert_eq!(checked, 397, "the parameter population changed");
         assert!(
             colliding.is_empty(),
             "these parameters would shadow a session flag: {colliding:?}"

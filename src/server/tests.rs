@@ -597,6 +597,47 @@ fn xrefs_paging_refuses_a_negative_offset_and_clamps_a_negative_limit() {
     assert!(IdaMcpServer::parse_xrefs_paging(&xrefs_request(None, Some(-1))).is_err());
 }
 
+fn find_symbols_request(needle: &str) -> crate::server::requests::DscFindSymbolsRequest {
+    serde_json::from_value(json!({ "needle": needle })).expect("request")
+}
+
+/// idalib cannot tell a NUL-bearing needle apart from a needle that matched
+/// nothing — both come back as the same `Err` — and the handler reads that
+/// `Err` as "no matches". So the needle that could only ever fail has to be
+/// rejected here, or it would be reported as a clean empty result.
+#[test]
+fn a_dsc_needle_that_ida_cannot_take_is_a_parameter_error() {
+    assert!(find_symbols_request("malloc").resolve_search().is_ok());
+    assert!(find_symbols_request("   ").resolve_search().is_err());
+    assert!(find_symbols_request("mal\0loc").resolve_search().is_err());
+}
+
+/// The needle is trimmed, so a padded one still finds the same symbols.
+#[test]
+fn a_dsc_needle_is_trimmed() {
+    let search = find_symbols_request("  malloc  ")
+        .resolve_search()
+        .expect("padded needle");
+    assert_eq!(search.needle, "malloc");
+}
+
+/// -1 is the "unlimited" sentinel and has to survive; anything past the
+/// schema's range is a parameter error rather than a silent clamp.
+#[test]
+fn dsc_dependency_depth_keeps_its_unlimited_sentinel() {
+    let request = |depth: Value| -> crate::server::requests::DscImageDepsRequest {
+        serde_json::from_value(json!({ "module": "/usr/lib/libSystem.B.dylib", "depth": depth }))
+            .expect("request")
+    };
+    assert_eq!(
+        request(json!(-1)).resolve_query().expect("unlimited").depth,
+        -1
+    );
+    assert_eq!(request(json!(1)).resolve_query().expect("direct").depth, 1);
+    assert!(request(json!(999)).resolve_query().is_err());
+    assert!(request(json!(-2)).resolve_query().is_err());
+}
+
 #[test]
 fn dsc_open_plan_backgrounds_ida_94_raw_dsc() {
     assert_eq!(
@@ -1574,7 +1615,7 @@ fn every_dispatchable_tool_declares_its_own_cli() {
         .into_iter()
         .map(|t| t.name.to_string())
         .collect();
-    assert_eq!(all.len(), 85, "the tool surface changed size");
+    assert_eq!(all.len(), 90, "the tool surface changed size");
 
     let mut expected: Vec<String> = all
         .iter()

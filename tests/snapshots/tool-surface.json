@@ -1,8 +1,8 @@
 {
   "counts": {
-    "native": 85,
-    "supervisor_safe": 85,
-    "supervisor_unsafe": 86
+    "native": 90,
+    "supervisor_safe": 90,
+    "supervisor_unsafe": 91
   },
   "native_tools": [
     "addr_info",
@@ -29,6 +29,11 @@
     "disasm_function_at",
     "dsc_add_dylib",
     "dsc_add_region",
+    "dsc_find_strings",
+    "dsc_find_symbols",
+    "dsc_image_deps",
+    "dsc_list_images",
+    "dsc_region_at",
     "entrypoints",
     "export_funcs",
     "exports",
@@ -121,6 +126,11 @@
     "disasm_function_at",
     "dsc_add_dylib",
     "dsc_add_region",
+    "dsc_find_strings",
+    "dsc_find_symbols",
+    "dsc_image_deps",
+    "dsc_list_images",
+    "dsc_region_at",
     "entrypoints",
     "export_funcs",
     "exports",

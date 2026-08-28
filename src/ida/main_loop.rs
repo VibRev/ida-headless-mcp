@@ -841,6 +841,99 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                 }
                 let _ = resp.send(result);
             }
+            IdaRequest::DscImages { query, resp } => {
+                debug!(
+                    offset = query.offset,
+                    limit = query.limit,
+                    filter = ?query.filter,
+                    regex = ?query.regex,
+                    loaded_only = query.loaded_only,
+                    "Listing DSC images"
+                );
+                let result = crate::crash_guard::crash_guarded("handle_dsc_images", || {
+                    dscu::handle_dsc_images(&idb, &query)
+                });
+                match &result {
+                    Ok(r) => debug!(count = r.images.len(), total = r.total, "Listed DSC images"),
+                    Err(e) => warn!(error = %e, "Failed to list DSC images"),
+                }
+                let _ = resp.send(result);
+            }
+            IdaRequest::DscImageDeps { query, resp } => {
+                debug!(
+                    module = %query.module,
+                    depth = query.depth,
+                    "Resolving DSC image dependencies"
+                );
+                let result = crate::crash_guard::crash_guarded("handle_dsc_image_deps", || {
+                    dscu::handle_dsc_image_deps(&idb, &query)
+                });
+                match &result {
+                    Ok(r) => debug!(
+                        count = r.images.len(),
+                        total = r.total,
+                        "Resolved DSC image dependencies"
+                    ),
+                    Err(e) => {
+                        warn!(module = %query.module, error = %e, "Failed to resolve DSC dependencies")
+                    }
+                }
+                let _ = resp.send(result);
+            }
+            IdaRequest::DscFindSymbols { search, resp } => {
+                debug!(
+                    needle = %search.needle,
+                    offset = search.offset,
+                    limit = search.limit,
+                    "Searching DSC symbols"
+                );
+                let result = crate::crash_guard::crash_guarded("handle_dsc_find_symbols", || {
+                    dscu::handle_dsc_find_symbols(&idb, &search)
+                });
+                match &result {
+                    Ok(r) => debug!(count = r.matches.len(), "Searched DSC symbols"),
+                    Err(e) => {
+                        warn!(needle = %search.needle, error = %e, "Failed to search DSC symbols")
+                    }
+                }
+                let _ = resp.send(result);
+            }
+            IdaRequest::DscFindStrings { search, resp } => {
+                debug!(
+                    needle = %search.needle,
+                    offset = search.offset,
+                    limit = search.limit,
+                    scope = ?search.scope,
+                    "Searching DSC strings"
+                );
+                let result = crate::crash_guard::crash_guarded("handle_dsc_find_strings", || {
+                    dscu::handle_dsc_find_strings(&idb, &search)
+                });
+                match &result {
+                    Ok(r) => debug!(count = r.matches.len(), "Searched DSC strings"),
+                    Err(e) => {
+                        warn!(needle = %search.needle, error = %e, "Failed to search DSC strings")
+                    }
+                }
+                let _ = resp.send(result);
+            }
+            IdaRequest::DscRegionAt { addr, resp } => {
+                debug!(address = format!("{addr:#x}"), "Resolving DSC region");
+                let result = crate::crash_guard::crash_guarded("handle_dsc_region_at", || {
+                    dscu::handle_dsc_region_at(&idb, addr)
+                });
+                match &result {
+                    Ok(region) => debug!(
+                        start = %region.start,
+                        kind = %region.kind,
+                        "Resolved DSC region"
+                    ),
+                    Err(e) => {
+                        warn!(address = format!("{addr:#x}"), error = %e, "Failed to resolve DSC region")
+                    }
+                }
+                let _ = resp.send(result);
+            }
             IdaRequest::ListFunctions { query, resp } => {
                 debug!(
                     offset = query.offset,
@@ -2138,6 +2231,11 @@ fn reject_with_error(req: IdaRequest, err: ToolError) {
         IdaRequest::AnalysisStatus { resp, .. } => reject!(resp, err),
         IdaRequest::DscLoadImage { resp, .. } => reject!(resp, err),
         IdaRequest::DscLoadRegion { resp, .. } => reject!(resp, err),
+        IdaRequest::DscImages { resp, .. } => reject!(resp, err),
+        IdaRequest::DscImageDeps { resp, .. } => reject!(resp, err),
+        IdaRequest::DscFindSymbols { resp, .. } => reject!(resp, err),
+        IdaRequest::DscFindStrings { resp, .. } => reject!(resp, err),
+        IdaRequest::DscRegionAt { resp, .. } => reject!(resp, err),
         IdaRequest::ListFunctions { resp, .. } => reject!(resp, err),
         IdaRequest::ResolveFunction { resp, .. } => reject!(resp, err),
         IdaRequest::DisasmByName { resp, .. } => reject!(resp, err),

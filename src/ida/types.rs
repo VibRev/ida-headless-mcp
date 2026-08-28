@@ -237,6 +237,95 @@ pub struct DscRegionInfo {
     pub loaded: bool,
 }
 
+/// `dsc_list_images` result.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DscImageList {
+    pub images: Vec<DscImageInfo>,
+    /// Matches before pagination, over the whole cache.
+    pub total: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_offset: Option<usize>,
+    /// The dyld_shared_cache backing this database, as IDA recorded it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_file_path: Option<String>,
+}
+
+/// `dsc_image_deps` result.
+///
+/// `images` includes the queried image itself — IDA's `get_image_dependencies`
+/// puts it in the output.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DscImageDeps {
+    pub images: Vec<DscImageInfo>,
+    pub total: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_offset: Option<usize>,
+    /// The image whose dependency closure this is.
+    pub module: String,
+    /// Recursion depth that produced it; -1 means unlimited.
+    pub depth: i32,
+}
+
+/// One `dsc_find_symbols` hit.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DscSymbolMatch {
+    pub symbol: String,
+    pub address: String,
+    pub address_value: u64,
+    /// -1 when the hit came from the cache's own `.symbols` table rather than
+    /// an image's export table.
+    pub image_index: i32,
+    /// Absent for cache-local hits (`image_index == -1`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_name: Option<String>,
+}
+
+/// `dsc_find_symbols` result.
+///
+/// No `total`: IDA's `find_symbol` stops collecting at the count it was given,
+/// so the only honest statement about the remainder is whether one exists —
+/// which is what `next_offset` says.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DscSymbolMatches {
+    pub matches: Vec<DscSymbolMatch>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_offset: Option<usize>,
+}
+
+/// One `dsc_find_strings` hit.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DscStringMatch {
+    pub address: String,
+    pub address_value: u64,
+    pub image_index: i32,
+    pub file_index: u64,
+    pub file_offset: u64,
+    pub context: String,
+}
+
+/// `dsc_find_strings` result. No `total`, for the reason in [`DscSymbolMatches`].
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DscStringMatches {
+    pub matches: Vec<DscStringMatch>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_offset: Option<usize>,
+}
+
+/// `dsc_region_at` result: what `dsc_add_region` would map, without mapping it.
+///
+/// Deliberately not [`DscRegionInfo`]. That type carries `loaded`, and idalib
+/// hardcodes it to false on the query path (`idalib_dscu_get_region_by_ea`),
+/// so reporting it here would be a lie rather than a lookup.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DscRegionQuery {
+    pub start: String,
+    pub start_value: u64,
+    pub size: u64,
+    pub kind: String,
+    pub image_index: i32,
+    pub name: String,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SymbolInfo {
     pub name: String,

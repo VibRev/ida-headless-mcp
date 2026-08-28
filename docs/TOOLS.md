@@ -5,11 +5,11 @@
 
 ## Discovery Workflow
 
-- `tools/list` returns the full tool set (currently 85 tools)
+- `tools/list` returns the full tool set (currently 90 tools)
 - `tool_catalog(query=...)` searches all tools by intent
 - `tool_help(name=...)` returns the full description and schema
 
-Every tool advertises a `title` and safety `annotations`. `outputSchema` is being restored tool by tool (85/85 so far); the "Output schema" column below says which ones have it.
+Every tool advertises a `title` and safety `annotations`. `outputSchema` is being restored tool by tool (90/90 so far); the "Output schema" column below says which ones have it.
 
 ## Sessions
 
@@ -28,6 +28,11 @@ Database open/close, analysis status, and discovery tools
 | `close_idb` | Release the open database | worker-local | yes | Close the currently open IDA database. |
 | `dsc_add_dylib` | Map a dylib out of the shared cache | routed | yes | Load an additional dylib into an open DSC database (requires prior open_dsc). |
 | `dsc_add_region` | Map a shared-cache address range | routed | yes | Load a DSC region by address into an open DSC database (data/GOT/stub areas; one address per call; requires prior open_dsc). |
+| `dsc_find_strings` | Search shared-cache strings | routed | yes | Search a dyld_shared_cache's bytes for a string (requires prior open_dsc; IDA 9.4+). |
+| `dsc_find_symbols` | Search shared-cache symbols | routed | yes | Search a dyld_shared_cache for symbols by substring (requires prior open_dsc; IDA 9.4+). |
+| `dsc_image_deps` | Shared-cache dependency closure | routed | yes | List what a shared-cache dylib depends on (requires prior open_dsc; IDA 9.4+). |
+| `dsc_list_images` | Shared-cache image table | routed | yes | List the dylib images in an open dyld_shared_cache (requires prior open_dsc; IDA 9.4+). |
+| `dsc_region_at` | Identify a shared-cache address | routed | yes | Resolve an address to the shared-cache region that holds it (requires prior open_dsc; IDA 9.4+). |
 | `idb_meta` | Database fingerprint | routed | yes | Get IDB metadata (ida-pro-mcp compatibility) |
 | `load_debug_info` | Attach external symbols | routed | yes | Load external debug info (e.g., DWARF/dSYM) into the current database. |
 | `open_dsc` | Open a dyld shared cache | worker-local | yes | Open a dyld_shared_cache and load a single dylib (e.g. |

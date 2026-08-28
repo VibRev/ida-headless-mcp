@@ -488,6 +488,102 @@ impl NameQuery {
     }
 }
 
+/// Where `dsc_find_strings` scans.
+///
+/// The two arms select different flag families in IDA, so they are an enum
+/// rather than a bool: the knobs that apply under `Images` are meaningless
+/// under `Files` and vice versa.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DscStringScope {
+    /// Scan the images' own contents.
+    #[default]
+    Images,
+    /// Scan whole cache files, including bytes no image claims.
+    Files,
+}
+
+/// A shared-cache image listing request, as it reaches the worker.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct DscImageQuery {
+    pub offset: usize,
+    pub limit: usize,
+    pub filter: Option<String>,
+    pub regex: Option<String>,
+    /// Keep only images already mapped into the database.
+    pub loaded_only: bool,
+}
+
+impl DscImageQuery {
+    pub fn name_filter(&self) -> Result<NameFilter, ToolError> {
+        NameFilter::compile(self.filter.as_deref(), self.regex.as_deref())
+    }
+}
+
+/// A shared-cache dependency-closure request.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct DscDepsQuery {
+    pub offset: usize,
+    pub limit: usize,
+    pub module: String,
+    /// 1 = direct dependencies only, -1 = the whole transitive closure.
+    pub depth: i32,
+}
+
+/// A shared-cache symbol search, as it reaches the worker.
+///
+/// The flag bits stay out of this type on purpose: `FSF_*` lives in the 9.4
+/// SDK, and this module has to compile on 9.2 and 9.3 too. The handler
+/// translates these bools where the SDK is in scope.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct DscSymbolSearch {
+    pub offset: usize,
+    pub limit: usize,
+    pub needle: String,
+    /// Skip the export tables of images that are not mapped in yet.
+    pub loaded_images_only: bool,
+    pub case_insensitive: bool,
+}
+
+/// A shared-cache string search, as it reaches the worker. See
+/// [`DscSymbolSearch`] on why `FSSF_*` is absent.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct DscStringSearch {
+    pub offset: usize,
+    pub limit: usize,
+    pub needle: String,
+    pub scope: DscStringScope,
+    /// Under [`DscStringScope::Images`]: scan every section, not just data.
+    pub all_sections: bool,
+    /// Under [`DscStringScope::Files`]: also scan the `.symbols` pool.
+    pub include_symbols: bool,
+    /// Under [`DscStringScope::Files`]: also scan branch-mapping files.
+    pub include_branch_mappings: bool,
+    /// Under [`DscStringScope::Files`]: also scan other adjacent files.
+    pub include_other: bool,
+    pub case_insensitive: bool,
+}
+
+/// How many matches to ask IDA for to serve a page starting at `offset`.
+///
+/// One past the page, so the answer can say whether a next page exists without
+/// scanning the whole cache for a count nobody asked for. IDA's `find_symbol` /
+/// `find_string` stop collecting at this number.
+pub fn dsc_scan_count(offset: usize, limit: usize) -> u64 {
+    offset.saturating_add(limit).saturating_add(1) as u64
+}
+
+/// Cut a scanned match list down to the requested page.
+///
+/// Returns the page and the `next_offset` to hand back, which is `Some` exactly
+/// when the scan turned up more than the page could hold.
+pub fn dsc_paginate<T>(matches: Vec<T>, offset: usize, limit: usize) -> (Vec<T>, Option<usize>) {
+    let mut page: Vec<T> = matches.into_iter().skip(offset).collect();
+    let has_more = page.len() > limit;
+    page.truncate(limit);
+    (page, has_more.then(|| offset.saturating_add(limit)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -555,5 +651,47 @@ mod tests {
             ..Default::default()
         };
         assert!(sorted.needs_full_scan());
+    }
+
+    /// The scan asks for one past the page precisely so the extra element can
+    /// answer "is there a next page?" without a second pass.
+    #[test]
+    fn a_dsc_scan_reads_one_past_the_page() {
+        assert_eq!(dsc_scan_count(0, 100), 101);
+        assert_eq!(dsc_scan_count(100, 100), 201);
+    }
+
+    #[test]
+    fn a_full_dsc_page_reports_the_next_offset() {
+        let scanned: Vec<u32> = (0..101).collect();
+        let (page, next) = dsc_paginate(scanned, 0, 100);
+        assert_eq!(page.len(), 100);
+        assert_eq!(page[0], 0);
+        assert_eq!(next, Some(100));
+    }
+
+    /// The last page is the one the scan could not fill, so it ends the walk.
+    #[test]
+    fn a_short_dsc_page_ends_the_walk() {
+        let scanned: Vec<u32> = (0..40).collect();
+        let (page, next) = dsc_paginate(scanned, 0, 100);
+        assert_eq!(page.len(), 40);
+        assert_eq!(next, None);
+    }
+
+    #[test]
+    fn a_dsc_page_past_the_end_is_empty_and_final() {
+        let scanned: Vec<u32> = (0..10).collect();
+        let (page, next) = dsc_paginate(scanned, 100, 100);
+        assert!(page.is_empty());
+        assert_eq!(next, None);
+    }
+
+    #[test]
+    fn a_dsc_page_starts_at_its_offset() {
+        let scanned: Vec<u32> = (0..25).collect();
+        let (page, next) = dsc_paginate(scanned, 10, 5);
+        assert_eq!(page, vec![10, 11, 12, 13, 14]);
+        assert_eq!(next, Some(15));
     }
 }

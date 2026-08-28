@@ -13,7 +13,7 @@
 - 一个 supervisor 进程负责 MCP 的 stdio 或 Streamable HTTP。
 - 每个打开的数据库对应独立的 IDA worker 进程；崩溃只影响一个会话，不会拖垮服务器。
 - 会话生命周期显式化：`idb_open`、`idb_list`、`idb_close`、`server_health`，以及全部需要 `database` 会话 ID 的分析工具。
-- 默认 85 个工具，加 `--unsafe` 是 86 个，分为 12 个分类。
+- 默认 90 个工具，加 `--unsafe` 是 91 个，分为 12 个分类。
 - 仅无头模式：调试器和 GUI 控制不进入公开接口。
 
 详见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) 和 [docs/MIGRATION.md](docs/MIGRATION.md)。

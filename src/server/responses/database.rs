@@ -285,6 +285,100 @@ pub struct DscAddRegionOutput {
     pub next_steps: Vec<String>,
 }
 
+/// `dsc_list_images` output.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DscImageListOutput {
+    /// Images in this page.
+    pub images: Vec<DscImageInfo>,
+    /// Matches before pagination, over the whole cache.
+    pub total: usize,
+    /// Offset to pass on the next call; absent on the last page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_offset: Option<usize>,
+    /// The dyld_shared_cache backing this database, as IDA recorded it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_file_path: Option<String>,
+}
+
+/// `dsc_image_deps` output. `images` includes the queried image itself.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DscImageDepsOutput {
+    pub images: Vec<DscImageInfo>,
+    pub total: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_offset: Option<usize>,
+    /// The image whose dependency closure this is.
+    pub module: String,
+    /// Recursion depth that produced it; -1 means unlimited.
+    pub depth: i32,
+}
+
+/// One `dsc_find_symbols` hit.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DscSymbolMatch {
+    pub symbol: String,
+    pub address: String,
+    pub address_value: u64,
+    /// -1 when the hit came from the cache's own `.symbols` table rather than
+    /// an image's export table.
+    pub image_index: i32,
+    /// Absent for cache-local hits (`image_index == -1`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_name: Option<String>,
+}
+
+/// `dsc_find_symbols` output.
+///
+/// No total: IDA stops collecting at the count it was given, so the only honest
+/// statement about the remainder is whether one exists.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DscFindSymbolsOutput {
+    pub matches: Vec<DscSymbolMatch>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_offset: Option<usize>,
+}
+
+/// One `dsc_find_strings` hit.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DscStringMatch {
+    pub address: String,
+    pub address_value: u64,
+    pub image_index: i32,
+    pub file_index: u64,
+    pub file_offset: u64,
+    pub context: String,
+}
+
+/// `dsc_find_strings` output. No total, for the reason in
+/// [`DscFindSymbolsOutput`].
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DscFindStringsOutput {
+    pub matches: Vec<DscStringMatch>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_offset: Option<usize>,
+}
+
+/// `dsc_region_at` output: what `dsc_add_region` would map, without mapping it.
+///
+/// Carries no `loaded`, unlike [`DscRegionInfo`]: IDA's query path does not
+/// report it, so the field would be a constant rather than an answer.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DscRegionAtOutput {
+    pub start: String,
+    pub start_value: u64,
+    pub size: u64,
+    pub kind: String,
+    pub image_index: i32,
+    pub name: String,
+}
+
 /// `open_dsc` output.
 ///
 /// Two arms: a background start (`status`/`task_id`/`message`) and a

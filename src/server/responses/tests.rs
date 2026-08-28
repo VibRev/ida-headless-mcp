@@ -423,6 +423,75 @@ fn mirrors_match_the_worker_types() {
         },
         "ExportInfo",
     );
+
+    let sample_image = || worker::DscImageInfo {
+        index: 7,
+        name: "/usr/lib/libSystem.B.dylib".to_string(),
+        file_name: "dyld_shared_cache_arm64e.03".to_string(),
+        address: "0x180000000".to_string(),
+        address_value: 0x180000000,
+        total_size: 0x4000,
+        file_index: Some(3),
+        loaded: true,
+    };
+    assert_mirrors::<DscImageInfo>(&sample_image(), "DscImageInfo");
+    assert_mirrors::<DscImageListOutput>(
+        &worker::DscImageList {
+            images: vec![sample_image()],
+            total: 3200,
+            next_offset: Some(100),
+            input_file_path: Some("/tmp/dyld_shared_cache_arm64e".to_string()),
+        },
+        "DscImageList",
+    );
+    assert_mirrors::<DscImageDepsOutput>(
+        &worker::DscImageDeps {
+            images: vec![sample_image()],
+            total: 12,
+            next_offset: Some(100),
+            module: "/usr/lib/libobjc.A.dylib".to_string(),
+            depth: -1,
+        },
+        "DscImageDeps",
+    );
+    assert_mirrors::<DscFindSymbolsOutput>(
+        &worker::DscSymbolMatches {
+            matches: vec![worker::DscSymbolMatch {
+                symbol: "_objc_msgSend".to_string(),
+                address: "0x180123456".to_string(),
+                address_value: 0x180123456,
+                image_index: 7,
+                image_name: Some("/usr/lib/libobjc.A.dylib".to_string()),
+            }],
+            next_offset: Some(100),
+        },
+        "DscSymbolMatches",
+    );
+    assert_mirrors::<DscFindStringsOutput>(
+        &worker::DscStringMatches {
+            matches: vec![worker::DscStringMatch {
+                address: "0x180222000".to_string(),
+                address_value: 0x180222000,
+                image_index: 7,
+                file_index: 3,
+                file_offset: 0x9a0,
+                context: "NSInvalidArgumentException".to_string(),
+            }],
+            next_offset: Some(100),
+        },
+        "DscStringMatches",
+    );
+    assert_mirrors::<DscRegionAtOutput>(
+        &worker::DscRegionQuery {
+            start: "0x180116000".to_string(),
+            start_value: 0x180116000,
+            size: 0x2000,
+            kind: "image_entity".to_string(),
+            image_index: 7,
+            name: "__TEXT".to_string(),
+        },
+        "DscRegionQuery",
+    );
 }
 
 /// `analysis_status` serializes the worker type and then splices

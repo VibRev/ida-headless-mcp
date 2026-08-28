@@ -13,7 +13,7 @@ This project is a derivative of [blacktop/ida-mcp-rs](https://github.com/blackto
 - One supervisor process owns MCP stdio or Streamable HTTP.
 - Each open database gets its own IDA worker process; a crash takes down one session, not the server.
 - Session lifecycle is explicit: `idb_open`, `idb_list`, `idb_close`, `server_health`, plus analysis tools that all require a `database` session ID.
-- 85 tools by default, 86 with `--unsafe`, in 12 categories.
+- 90 tools by default, 91 with `--unsafe`, in 12 categories.
 - Headless-only: debugger and GUI control stay out of the public surface.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/MIGRATION.md](docs/MIGRATION.md).

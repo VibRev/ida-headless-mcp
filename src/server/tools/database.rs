@@ -1150,22 +1150,7 @@ impl IdaMcpServer {
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: dsc_add_dylib");
 
-        let module = req.module.trim().to_string();
-        if module.is_empty() {
-            return Ok(ToolError::InvalidParams("module must not be empty".into()).to_tool_result());
-        }
-        if !module.starts_with('/') {
-            return Ok(ToolError::InvalidParams(
-                "module must be an absolute path (start with '/')".into(),
-            )
-            .to_tool_result());
-        }
-        if module.contains("..") {
-            return Ok(ToolError::InvalidParams(
-                "module must not contain '..' path traversal".into(),
-            )
-            .to_tool_result());
-        }
+        let module = try_param!(Self::validate_dsc_module(&req.module));
 
         let timeout_secs = try_param!(parse_optional_unsigned::<u64>(
             req.timeout_secs,
@@ -1309,6 +1294,201 @@ impl IdaMcpServer {
                 ))
                 .to_tool_result())
             }
+            Err(e) => Ok(e.to_tool_result()),
+        }
+    }
+
+    /// Normalize a DSC-internal dylib path, as the loader names it.
+    ///
+    /// Absolute because that is how the cache stores them, and `..`-free
+    /// because nothing downstream resolves the path — a traversal here could
+    /// only ever be a miss wearing a path's clothes.
+    fn validate_dsc_module(module: &str) -> Result<String, ToolError> {
+        let module = module.trim().to_string();
+        if module.is_empty() {
+            return Err(ToolError::InvalidParams("module must not be empty".into()));
+        }
+        if !module.starts_with('/') {
+            return Err(ToolError::InvalidParams(
+                "module must be an absolute path (start with '/')".into(),
+            ));
+        }
+        if module.contains("..") {
+            return Err(ToolError::InvalidParams(
+                "module must not contain '..' path traversal".into(),
+            ));
+        }
+        Ok(module)
+    }
+
+    #[vibrev_tool(
+        description = "List the dylib images in an open dyld_shared_cache (requires prior \
+        open_dsc; IDA 9.4+). Opening a DSC maps the header only, so start here to find the \
+        image you want, then map it with dsc_add_dylib. \
+        Answers {images, total, next_offset, input_file_path}.",
+        output = "responses::DscImageListOutput",
+        title = "Shared-cache image table",
+        annotations(
+            read_only = true,
+            destructive = false,
+            idempotent = true,
+            open_world = false
+        ),
+        cli(positional = "filter")
+    )]
+    #[instrument(skip_all, fields(filter = ?req.filter, loaded_only = ?req.loaded_only))]
+    async fn dsc_list_images(
+        &self,
+        Parameters(req): Parameters<DscListImagesRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: dsc_list_images");
+        let query = try_param!(req.resolve_query());
+        let timeout_secs = try_param!(parse_optional_unsigned::<u64>(
+            req.timeout_secs,
+            "timeout_secs"
+        ));
+        match self.worker.dsc_images(query, timeout_secs).await {
+            Ok(result) => Ok(structured_value(&result, "dsc_list_images")),
+            Err(e) => Ok(e.to_tool_result()),
+        }
+    }
+
+    #[vibrev_tool(
+        description = "List what a shared-cache dylib depends on (requires prior open_dsc; \
+        IDA 9.4+). depth=1 gives direct dependencies, depth=-1 the whole transitive closure. \
+        The queried image is itself part of the answer. \
+        Answers {images, total, next_offset, module, depth}.",
+        output = "responses::DscImageDepsOutput",
+        title = "Shared-cache dependency closure",
+        annotations(
+            read_only = true,
+            destructive = false,
+            idempotent = true,
+            open_world = false
+        ),
+        cli(positional = "module")
+    )]
+    #[instrument(skip_all, fields(module = %req.module, depth = ?req.depth))]
+    async fn dsc_image_deps(
+        &self,
+        Parameters(req): Parameters<DscImageDepsRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: dsc_image_deps");
+        try_param!(Self::validate_dsc_module(&req.module));
+        let query = try_param!(req.resolve_query());
+        let timeout_secs = try_param!(parse_optional_unsigned::<u64>(
+            req.timeout_secs,
+            "timeout_secs"
+        ));
+        match self.worker.dsc_image_deps(query, timeout_secs).await {
+            Ok(result) => Ok(structured_value(&result, "dsc_image_deps")),
+            Err(e) => Ok(e.to_tool_result()),
+        }
+    }
+
+    #[vibrev_tool(
+        description = "Search a dyld_shared_cache for symbols by substring (requires prior \
+        open_dsc; IDA 9.4+). Reads the cache's local symbol table and every image's export \
+        table, including images that are not mapped in yet — use this to find which dylib to \
+        load. image_index is -1 when the hit came from the cache's own '.symbols' file. \
+        Answers {matches, next_offset}.",
+        output = "responses::DscFindSymbolsOutput",
+        title = "Search shared-cache symbols",
+        annotations(
+            read_only = true,
+            destructive = false,
+            idempotent = true,
+            open_world = false
+        ),
+        cli(positional = "needle")
+    )]
+    #[instrument(skip_all, fields(needle = %req.needle))]
+    async fn dsc_find_symbols(
+        &self,
+        Parameters(req): Parameters<DscFindSymbolsRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: dsc_find_symbols");
+        let search = try_param!(req.resolve_search());
+        let timeout_secs = try_param!(parse_optional_unsigned::<u64>(
+            req.timeout_secs,
+            "timeout_secs"
+        ));
+        match self.worker.dsc_find_symbols(search, timeout_secs).await {
+            Ok(result) => Ok(structured_value(&result, "dsc_find_symbols")),
+            Err(e) => Ok(e.to_tool_result()),
+        }
+    }
+
+    #[vibrev_tool(
+        description = "Search a dyld_shared_cache's bytes for a string (requires prior \
+        open_dsc; IDA 9.4+). scope='images' (default) reads the images' contents, \
+        scope='files' reads whole cache files including bytes no image claims. Scanning is a \
+        byte-level pass over the cache and does not need images mapped in. \
+        Answers {matches, next_offset}.",
+        output = "responses::DscFindStringsOutput",
+        title = "Search shared-cache strings",
+        annotations(
+            read_only = true,
+            destructive = false,
+            idempotent = true,
+            open_world = false
+        ),
+        cli(positional = "needle")
+    )]
+    #[instrument(skip_all, fields(needle = %req.needle, scope = ?req.scope))]
+    async fn dsc_find_strings(
+        &self,
+        Parameters(req): Parameters<DscFindStringsRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: dsc_find_strings");
+        let search = try_param!(req.resolve_search());
+        let timeout_secs = try_param!(parse_optional_unsigned::<u64>(
+            req.timeout_secs,
+            "timeout_secs"
+        ));
+        match self.worker.dsc_find_strings(search, timeout_secs).await {
+            Ok(result) => Ok(structured_value(&result, "dsc_find_strings")),
+            Err(e) => Ok(e.to_tool_result()),
+        }
+    }
+
+    #[vibrev_tool(
+        description = "Resolve an address to the shared-cache region that holds it (requires \
+        prior open_dsc; IDA 9.4+). This only looks the address up — it maps nothing. Use it \
+        to see what an unmapped address is before deciding to load it, then call \
+        dsc_add_region (or dsc_add_dylib, for kind='image_entity') to bring it in. \
+        Answers {start, start_value, size, kind, image_index, name}.",
+        output = "responses::DscRegionAtOutput",
+        title = "Identify a shared-cache address",
+        annotations(
+            read_only = true,
+            destructive = false,
+            idempotent = true,
+            open_world = false
+        ),
+        cli(positional = "address", int_args = "address")
+    )]
+    #[instrument(skip_all, fields(address = ?req.address))]
+    async fn dsc_region_at(
+        &self,
+        Parameters(req): Parameters<DscRegionAtRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: dsc_region_at");
+        let ea = match req.address.to_exactly_one("address") {
+            Ok(value) => value,
+            Err(ToolError::InvalidAddress(addr)) => {
+                return Ok(
+                    ToolError::InvalidParams(format!("Invalid address: {addr}")).to_tool_result()
+                );
+            }
+            Err(e) => return Ok(e.to_tool_result()),
+        };
+        let timeout_secs = try_param!(parse_optional_unsigned::<u64>(
+            req.timeout_secs,
+            "timeout_secs"
+        ));
+        match self.worker.dsc_region_at(ea, timeout_secs).await {
+            Ok(result) => Ok(structured_value(&result, "dsc_region_at")),
             Err(e) => Ok(e.to_tool_result()),
         }
     }
