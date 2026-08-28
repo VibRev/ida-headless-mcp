@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 # Exercise the HTTP worker-pool path. Cases:
-#   concurrency  - a long call in session A must not block session B
-#   exhaustion   - a third open fails when two workers are leased
-#   crash        - a child exit is contained and the session can re-open
-#   disconnect   - dropped client SSE streams release leased workers
+#   concurrency  - a long call in one database must not block another
+#   exhaustion   - an open fails once every worker is leased
+#   crash        - a child exit is contained and the database can be re-opened
+#   disconnect   - a dropped SSE stream closes the transport, not the database
 #   manager-disconnect - dropped standalone SSE closes pooled rmcp session without opening IDA
-#   second-open-failure - failed second open keeps the existing session lease/IDB
+#   second-open-failure - a failed open keeps the existing session's lease/IDB
+#
+# Every case talks to the supervisor: `idb_open` returns a `database` ID and
+# every routed tool carries it. Worker-local `open_idb`/`close_idb` are not
+# routable here — the supervisor owns database lifecycle.
 set -euo pipefail
 
 CASE="${POOL_TEST_CASE:-${1:-concurrency}}"
@@ -17,6 +21,12 @@ BIND_HOST="${MCP_HTTP_BIND_HOST:-127.0.0.1}"
 CONNECT_HOST="${MCP_HTTP_CONNECT_HOST:-127.0.0.1}"
 IDB_PATH="${IDB_PATH:-fixtures/mini}"
 MAX_WORKERS="${MAX_WORKERS:-2}"
+# One worker is what makes a second open fail at all: the supervisor opens a
+# second database in its own session rather than refusing, so "the open that
+# fails" is now the one with no worker left to lease.
+if [[ "${CASE}" == "second-open-failure" ]]; then
+  MAX_WORKERS="${MAX_WORKERS_OVERRIDE:-1}"
+fi
 OP_TIMEOUT="${WORKER_OP_TIMEOUT:-20}"
 DISCONNECT_GRACE="${WORKER_DISCONNECT_GRACE:-1}"
 
@@ -87,8 +97,12 @@ curl_headers=(
   -H "Origin: $ORIGIN"
   "${mcp_auth[@]}"
 )
-url="http://$CONNECT_HOST:$PORT/"
+# `/mcp`, not `/`: the Streamable HTTP endpoint has its own path, and posting
+# to the root returns 404 before `initialize` is ever seen.
+url="http://$CONNECT_HOST:$PORT/mcp"
 
+# `--unsafe` because three of these cases drive the pool through `run_script`,
+# which is gated behind it.
 "$BIN" serve --mode http --token-file "$token_file" \
   --bind "$BIND_HOST:$PORT" \
   --allow-origin "$ALLOW_ORIGIN" \
@@ -96,6 +110,7 @@ url="http://$CONNECT_HOST:$PORT/"
   --worker-idle-timeout-secs 60 \
   --worker-op-timeout-secs "$OP_TIMEOUT" \
   --worker-disconnect-grace-secs "$DISCONNECT_GRACE" \
+  --unsafe \
   >"$server_log" 2>&1 &
 server_pid=$!
 
@@ -194,22 +209,33 @@ wait_for_log() {
   return 1
 }
 
-open_fixture() {
+# Open a database and echo the session ID the supervisor minted for it. That
+# ID, not the transport session, is what every routed tool is addressed to.
+open_database() {
   local sid="$1" rid="$2" path="$3"
-  local args resp
-  args="$(jq -cn --arg path "$path" '{path:$path}')"
-  resp="$(tool_call "$sid" "$rid" open_idb "$args" 45)"
-  assert_tool_ok "$resp" "open_idb $path"
-  printf '%s' "$resp" | tool_text | jq -e '.function_count' >/dev/null || {
-    echo "open_idb response missing function_count for $path" >&2
+  local args resp database
+  args="$(jq -cn --arg path "$path" '{input_path:$path}')"
+  resp="$(tool_call "$sid" "$rid" idb_open "$args" 45)"
+  assert_tool_ok "$resp" "idb_open $path"
+  database="$(printf '%s' "$resp" | tool_text | jq -r '.session.session_id // empty')"
+  if [[ -z "$database" ]]; then
+    echo "idb_open returned no session ID for $path" >&2
     printf '%s\n' "$resp" | jq . >&2
+    cat "$server_log" >&2 || true
     exit 1
-  }
+  fi
+  printf '%s' "$database"
 }
 
-close_session() {
-  local sid="$1" rid="$2"
-  tool_call "$sid" "$rid" close_idb '{}' 10 >/dev/null || true
+close_database() {
+  local sid="$1" rid="$2" database="$3"
+  tool_call "$sid" "$rid" idb_close "$(jq -cn --arg d "$database" '{database:$d}')" 10 >/dev/null || true
+}
+
+# Routed tools all take `database`; this saves spelling the merge each time.
+database_args() {
+  local database="$1" extra="${2:-{\}}"
+  jq -cn --arg d "$database" --argjson extra "$extra" '{database:$d} + $extra'
 }
 
 start_standalone_stream() {
@@ -233,18 +259,19 @@ session_c="$(init_session)"
 
 case "$CASE" in
 concurrency)
-  open_fixture "$session_a" 10 "$fixture_a"
-  open_fixture "$session_b" 20 "$fixture_b"
+  database_a="$(open_database "$session_a" 10 "$fixture_a")"
+  database_b="$(open_database "$session_a" 20 "$fixture_b")"
 
-  slow_args="$(jq -cn --arg code 'import time; time.sleep(8); print("slow done")' \
-    '{code:$code,timeout_secs:15}')"
+  slow_args="$(database_args "$database_a" \
+    "$(jq -cn --arg code 'import time; time.sleep(8); print("slow done")' \
+      '{code:$code,timeout_secs:15}')")"
   slow_resp_file="$tmpdir/slow-response.json"
   tool_call "$session_a" 30 run_script "$slow_args" 20 >"$slow_resp_file" &
   slow_pid=$!
   sleep 1
 
-  status_resp="$(tool_call "$session_b" 31 analysis_status '{}' 4)"
-  assert_tool_ok "$status_resp" "analysis_status while session A is busy"
+  status_resp="$(tool_call "$session_b" 31 analysis_status "$(database_args "$database_b")" 4)"
+  assert_tool_ok "$status_resp" "analysis_status while the other database is busy"
   if ! kill -0 "$slow_pid" 2>/dev/null; then
     echo "slow run_script finished before concurrency check completed" >&2
     cat "$slow_resp_file" >&2 || true
@@ -260,29 +287,29 @@ concurrency)
     printf '%s\n' "$slow_resp" | jq . >&2
     exit 1
   }
-  close_session "$session_a" 90
-  close_session "$session_b" 91
+  close_database "$session_a" 90 "$database_a"
+  close_database "$session_a" 91 "$database_b"
   echo "HTTP pool concurrency test passed"
   ;;
 
 exhaustion)
-  open_fixture "$session_a" 10 "$fixture_a"
-  open_fixture "$session_b" 20 "$fixture_b"
-  third_args="$(jq -cn --arg path "$fixture_c" '{path:$path}')"
-  third_resp="$(tool_call "$session_c" 30 open_idb "$third_args" 15)"
+  database_a="$(open_database "$session_a" 10 "$fixture_a")"
+  database_b="$(open_database "$session_a" 20 "$fixture_b")"
+  third_args="$(jq -cn --arg path "$fixture_c" '{input_path:$path}')"
+  third_resp="$(tool_call "$session_c" 30 idb_open "$third_args" 15)"
   assert_tool_error_contains "$third_resp" "Worker pool exhausted" "third pooled open"
-  close_session "$session_a" 90
-  close_session "$session_b" 91
+  close_database "$session_a" 90 "$database_a"
+  close_database "$session_a" 91 "$database_b"
   echo "HTTP pool exhaustion test passed"
   ;;
 
 second-open-failure)
-  open_fixture "$session_a" 10 "$fixture_a"
-  second_args="$(jq -cn --arg path "$fixture_b" '{path:$path}')"
-  second_resp="$(tool_call "$session_a" 20 open_idb "$second_args" 15)"
-  assert_tool_error_contains "$second_resp" "A database is already open" "second pooled open"
+  database_a="$(open_database "$session_a" 10 "$fixture_a")"
+  second_args="$(jq -cn --arg path "$fixture_b" '{input_path:$path}')"
+  second_resp="$(tool_call "$session_a" 20 idb_open "$second_args" 15)"
+  assert_tool_error_contains "$second_resp" "Worker pool exhausted" "second pooled open"
 
-  meta_resp="$(tool_call "$session_a" 30 idb_meta '{}' 10)"
+  meta_resp="$(tool_call "$session_a" 30 idb_meta "$(database_args "$database_a")" 10)"
   assert_tool_ok "$meta_resp" "idb_meta after failed second open"
   printf '%s' "$meta_resp" | tool_text | jq -e '(.path // .input_file_path // "") | contains("mini-a")' >/dev/null || {
     echo "failed second open did not preserve the original database" >&2
@@ -291,52 +318,61 @@ second-open-failure)
     exit 1
   }
 
-  close_session "$session_a" 90
+  close_database "$session_a" 90 "$database_a"
   echo "HTTP pool second-open failure test passed"
   ;;
 
 crash)
-  open_fixture "$session_a" 10 "$fixture_a"
-  open_fixture "$session_b" 20 "$fixture_b"
-  crash_args="$(jq -cn --arg code 'import os; os._exit(139)' '{code:$code,timeout_secs:10}')"
+  database_a="$(open_database "$session_a" 10 "$fixture_a")"
+  database_b="$(open_database "$session_a" 20 "$fixture_b")"
+  crash_args="$(database_args "$database_a" \
+    "$(jq -cn --arg code 'import os; os._exit(139)' '{code:$code,timeout_secs:10}')")"
   crash_resp="$(tool_call "$session_a" 30 run_script "$crash_args" 15)"
   assert_tool_error_contains "$crash_resp" "Worker" "crashing child call"
 
-  status_resp="$(tool_call "$session_b" 31 analysis_status '{}' 10)"
+  status_resp="$(tool_call "$session_a" 31 analysis_status "$(database_args "$database_b")" 10)"
   assert_tool_ok "$status_resp" "analysis_status in unaffected session"
 
-  open_fixture "$session_a" 40 "$fixture_c"
-  close_session "$session_a" 90
-  close_session "$session_b" 91
+  database_c="$(open_database "$session_a" 40 "$fixture_c")"
+  close_database "$session_a" 90 "$database_c"
+  close_database "$session_a" 91 "$database_b"
   echo "HTTP pool crash-containment test passed"
   ;;
 
 disconnect)
-  open_fixture "$session_a" 10 "$fixture_a"
-  open_fixture "$session_b" 20 "$fixture_b"
+  # Databases used to belong to the transport session that opened them, and
+  # dropping its stream released the worker. They do not any more: a database
+  # is addressed by ID from any connection, so this asserts the boundary that
+  # replaced it — the abandoned transport session is closed, and the database
+  # it opened survives that and is still reachable from another connection.
+  database_a="$(open_database "$session_a" 10 "$fixture_a")"
 
-  sse_a_pid="$(start_standalone_stream "$session_a" session-a)"
-  sse_b_pid="$(start_standalone_stream "$session_b" session-b)"
-  kill "$sse_a_pid" "$sse_b_pid" >/dev/null 2>&1 || true
-  wait "$sse_a_pid" "$sse_b_pid" >/dev/null 2>&1 || true
-  sleep "$((DISCONNECT_GRACE + 2))"
-
-  open_fixture "$session_c" 30 "$fixture_c"
-  close_session "$session_c" 91
-  echo "HTTP pool disconnect cleanup test passed"
-  ;;
-
-manager-disconnect)
   sse_a_pid="$(start_standalone_stream "$session_a" session-a)"
   kill "$sse_a_pid" >/dev/null 2>&1 || true
   wait "$sse_a_pid" >/dev/null 2>&1 || true
   unset sse_a_pid
 
-  if ! wait_for_log "Using disconnect-aware pooled HTTP session manager" 5; then
-    echo "pooled HTTP path did not install the disconnect-aware session manager" >&2
+  if ! wait_for_log "closing pooled HTTP session after client stream disconnect" "$((DISCONNECT_GRACE + 5))"; then
+    echo "pooled session manager did not close the abandoned transport session" >&2
     cat "$server_log" >&2 || true
     exit 1
   fi
+
+  status_resp="$(tool_call "$session_c" 30 analysis_status "$(database_args "$database_a")" 10)"
+  assert_tool_ok "$status_resp" "database outliving the transport session that opened it"
+
+  close_database "$session_c" 90 "$database_a"
+  echo "HTTP pool disconnect cleanup test passed"
+  ;;
+
+manager-disconnect)
+  # The same wiring with nothing open: the manager must close an abandoned
+  # stream without a database having been opened over it.
+  sse_a_pid="$(start_standalone_stream "$session_a" session-a)"
+  kill "$sse_a_pid" >/dev/null 2>&1 || true
+  wait "$sse_a_pid" >/dev/null 2>&1 || true
+  unset sse_a_pid
+
   if ! wait_for_log "closing pooled HTTP session after client stream disconnect" "$((DISCONNECT_GRACE + 5))"; then
     echo "pooled session manager did not close abandoned standalone SSE stream" >&2
     cat "$server_log" >&2 || true
