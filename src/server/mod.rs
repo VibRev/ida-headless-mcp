@@ -233,19 +233,20 @@ pub const SESSION: SessionSpec = SessionSpec {
     selector: Some("database"),
     flag: "idb",
     value_name: "PATH",
-    help: "要打开的 .i64/.idb 或原始二进制（工具在它上面执行）",
-    missing: "IDA 的每个工具都读当前打开的数据库，而 CLI 是一次性进程，必须先知道打开哪个。\
-              注意这是「打开并独占」，不是连接到正在运行的 MCP 服务器的会话。",
+    help: "The .i64/.idb or raw binary to open (the tool runs against it)",
+    missing: "Every IDA tool reads the currently open database, and the CLI is a one-shot process, \
+              so it has to know which one to open. Note this is open-and-own, not an attach to a \
+              running MCP server session.",
     ready: Some(ReadySpec {
         skip_flag: "no-wait-analysis",
-        skip_help: "跳过等待 auto_is_ok；未收敛的数据库会返回看似合理的不完整数据",
+        skip_help: "Skip waiting for auto_is_ok; an unconverged database will return plausible-looking incomplete data",
         // `open_idb` itself is capped at 600s; matching it keeps the two halves
         // of one command from disagreeing about how long is too long.
         timeout: Duration::from_secs(600),
         poll: Duration::from_millis(200),
-        timed_out: "警告：等待自动分析收敛超时，下面的结果可能是不完整的（计数偏小、xref 缺失）。\
-                    用 analysis_status 确认，或对大型二进制先跑 analyze_funcs。",
-        unknown: "警告：无法确认自动分析是否已收敛，下面的结果可能是不完整的",
+        timed_out: "warning: timed out waiting for auto-analysis to converge; the results below may be incomplete \
+                    (undercounts, missing xrefs). Confirm with analysis_status, or run analyze_funcs first on a large binary.",
+        unknown: "warning: could not confirm that auto-analysis has converged; the results below may be incomplete",
     }),
 };
 

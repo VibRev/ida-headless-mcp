@@ -651,11 +651,11 @@ fn with_lock_advice(error: &str) -> String {
     }
     format!(
         "{error}\n\
-         提示：该数据库已被另一个进程独占（上面括号里是它的 pid）。CLI 的 --idb 是\
-         「打开并独占」，无法连接到已在运行的会话，所以可选：\n  \
-         1) 通过那个 MCP 服务器调用同名工具；\n  \
-         2) 结束该进程（或让它 close_idb / idb_close）后重试；\n  \
-         3) 复制一份数据库，对副本用 --idb。"
+         hint: that database is already owned by another process (the pid is in parentheses above). \
+         The CLI's --idb is open-and-own; it cannot attach to a running session, so the options are:\n  \
+         1) call the same tool through that MCP server;\n  \
+         2) stop that process (or have it close_idb / idb_close) and retry;\n  \
+         3) copy the database and use --idb on the copy."
     )
 }
 
