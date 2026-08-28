@@ -22,19 +22,6 @@ use serde_json::{json, Value};
 use std::path::PathBuf;
 use vibrev_kit::contract::{Audit, SurfaceReport};
 
-/// Supervisor-implemented session tools that publish an `outputSchema`.
-///
-/// Not a ratchet. A name-per-tool list would say "all of them" the long way and
-/// make every new tool an edit to it; `vibrev-kit`'s `OutputSchemas::Required`
-/// says it in one word and covers a tool the day it lands. (`Staged(&[..])` is
-/// there for a conversion that is genuinely mid-flight.)
-///
-/// What survives is the IDA-specific half: a session tool answers failure in the
-/// payload rather than through `isError`, so its schema has to admit both arms —
-/// something no other engine's surface does.
-const SESSION_TOOLS_WITH_OUTPUT_SCHEMA: &[&str] =
-    &["idb_close", "idb_list", "idb_open", "server_health"];
-
 // Tools that must report how complete the analysis was.
 //
 // `open_idb` returns before auto-analysis settles. Every tool below answers
@@ -356,13 +343,9 @@ fn the_supervisor_face_is_object_rooted_and_keeps_its_schemas() {
         "expected most of the catalog to route, got {routed}"
     );
 
-    // Session tools are the supervisor's own, and they report failure in the
-    // payload rather than through `isError`, so their schema has to admit both.
-    for name in SESSION_TOOLS_WITH_OUTPUT_SCHEMA {
-        assert!(
-            SESSION_TOOLS.contains(name),
-            "SESSION_TOOLS_WITH_OUTPUT_SCHEMA names {name}, which is not a session tool"
-        );
+    // Session-tool schemas describe successful structured output only. Errors
+    // travel as `isError: true` without `structuredContent`.
+    for name in SESSION_TOOLS {
         let tool = supervisor
             .iter()
             .find(|tool| tool.name.as_ref() == *name)
@@ -371,10 +354,19 @@ fn the_supervisor_face_is_object_rooted_and_keeps_its_schemas() {
             .output_schema
             .as_ref()
             .unwrap_or_else(|| panic!("{name} lost its outputSchema"));
-        assert!(
-            schema.contains_key("anyOf"),
-            "{name} must admit both the success and the {{error}} arm"
-        );
+        if *name == "server_health" {
+            assert_eq!(
+                schema.get("anyOf").and_then(Value::as_array).map(Vec::len),
+                Some(2),
+                "server_health must advertise its two success shapes"
+            );
+        } else {
+            assert_eq!(schema.get("type").and_then(Value::as_str), Some("object"));
+            assert!(
+                !schema.contains_key("anyOf"),
+                "{name} has one success shape"
+            );
+        }
     }
 }
 
