@@ -13,6 +13,7 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::borrow::Cow;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 use vibrev_kit::policy::ToolPolicy;
 
 /// Session lifecycle tools implemented by the supervisor itself.
@@ -147,6 +148,7 @@ impl SupervisorServer {
         &self,
         name: &str,
         arguments: Map<String, Value>,
+        cancel: CancellationToken,
     ) -> Result<Value, String> {
         match name {
             "idb_open" => {
@@ -165,7 +167,7 @@ impl SupervisorServer {
                 };
                 serde_json::to_value(
                     self.sessions
-                        .open(request, None)
+                        .open(request, Some(cancel))
                         .await
                         .map_err(|error| error.to_string())?,
                 )
@@ -212,6 +214,7 @@ impl SupervisorServer {
         &self,
         name: &str,
         mut arguments: Map<String, Value>,
+        cancel: CancellationToken,
     ) -> Result<CallToolResult, String> {
         if !is_routable_tool(name) {
             return Err(unknown_tool_message(name));
@@ -229,7 +232,7 @@ impl SupervisorServer {
                 "Missing required argument 'database'. Session ID returned by idb_open. Use idb_list to enumerate open databases.".to_string()
             })?;
         self.sessions
-            .call_native_result(&database, name, arguments, None)
+            .call_native_result(&database, name, arguments, Some(cancel))
             .await
             .map_err(|error| error.to_string())
     }
@@ -296,7 +299,7 @@ impl ServerHandler for SupervisorServer {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
         let name = request.name.to_string();
         let is_session_tool = SESSION_TOOLS.contains(&name.as_str());
@@ -304,13 +307,11 @@ impl ServerHandler for SupervisorServer {
             return Err(McpError::invalid_params(disabled_tool_message(&name), None));
         }
         let arguments = request.arguments.unwrap_or_default();
+        let cancel = context.ct;
         let result = if is_session_tool {
-            match self.call_management(&name, arguments).await {
-                Ok(value) => tool_result(value, false),
-                Err(error) => tool_result(json!({"error": error}), false),
-            }
+            management_tool_result(self.call_management(&name, arguments, cancel).await)
         } else {
-            match self.call_worker(&name, arguments).await {
+            match self.call_worker(&name, arguments, cancel).await {
                 // Verbatim. A worker's answer is already a `CallToolResult`, and
                 // rebuilding one here is how the pretty rendering it chose gets
                 // replaced by compact JSON, and how an error message it wrote
@@ -475,48 +476,16 @@ fn tool(
     )
 }
 
-/// Output schema for a supervisor session tool.
-///
-/// [`SupervisorServer::call_tool`] reports a *session* tool failure as a
-/// successful result whose payload is `{"error": "..."}` — only routed worker
-/// tools get `isError: true`, because a bad `idb_open` argument is not a
-/// transport failure. The published schema therefore has to admit that arm
-/// next to the success shape, or every failed `idb_open` would violate it.
+/// Output schema for a successful supervisor session-tool call. Failures use
+/// `isError: true` and carry no `structuredContent`, just like routed tools.
 fn session_output_schema<T>() -> Arc<rmcp::model::JsonObject>
 where
     T: rmcp::schemars::JsonSchema + std::any::Any,
 {
-    let mut success = Value::Object((*crate::server::responses::schema::<T>()).clone());
-    let mut defs = Map::new();
-    detach_schema_document_keys(&mut success, &mut defs);
-
-    let mut schema = Map::new();
-    schema.insert(
-        "anyOf".to_string(),
-        json!([
-            success,
-            {
-                "type": "object",
-                "properties": {
-                    "error": {
-                        "type": "string",
-                        "description": "Why the request could not be carried out.",
-                    },
-                },
-                "required": ["error"],
-            }
-        ]),
-    );
-    if !defs.is_empty() {
-        schema.insert("$defs".to_string(), Value::Object(defs));
-    }
-    Arc::new(schema)
+    crate::server::responses::schema::<T>()
 }
 
-/// `server_health` has two success shapes (one session vs every session), so
-/// the published document is a flat `anyOf` of both plus the session-tool
-/// `{error}` arm. Nested `anyOf` would still be valid, but this is what
-/// `call_management` actually serializes.
+/// `server_health` has two success shapes: one session or every session.
 fn server_health_output_schema() -> Arc<rmcp::model::JsonObject> {
     let mut one = Value::Object((*crate::server::responses::schema::<SessionHealth>()).clone());
     let mut all = Value::Object((*crate::server::responses::schema::<SessionHealthList>()).clone());
@@ -525,23 +494,7 @@ fn server_health_output_schema() -> Arc<rmcp::model::JsonObject> {
     detach_schema_document_keys(&mut all, &mut defs);
 
     let mut schema = Map::new();
-    schema.insert(
-        "anyOf".to_string(),
-        json!([
-            one,
-            all,
-            {
-                "type": "object",
-                "properties": {
-                    "error": {
-                        "type": "string",
-                        "description": "Why the request could not be carried out.",
-                    },
-                },
-                "required": ["error"],
-            }
-        ]),
-    );
+    schema.insert("anyOf".to_string(), json!([one, all]));
     if !defs.is_empty() {
         schema.insert("$defs".to_string(), Value::Object(defs));
     }
@@ -749,6 +702,13 @@ fn tool_result(value: Value, is_error: bool) -> CallToolResult {
     result
 }
 
+fn management_tool_result(result: Result<Value, String>) -> CallToolResult {
+    match result {
+        Ok(value) => tool_result(value, false),
+        Err(error) => tool_result(json!({"error": error}), true),
+    }
+}
+
 fn disabled_tool_message(name: &str) -> String {
     format!(
         "tool '{name}' is disabled by current filter \
@@ -863,7 +823,7 @@ mod tests {
         let mut arguments = Map::new();
         arguments.insert("database".to_string(), json!("missing"));
         let error = server
-            .call_management("server_health", arguments)
+            .call_management("server_health", arguments, CancellationToken::new())
             .await
             .expect_err("unknown database");
         assert!(error.contains("Unknown database session"), "{error}");
@@ -873,22 +833,18 @@ mod tests {
     async fn server_health_without_database_lists_sessions() {
         let server = test_supervisor();
         let value = server
-            .call_management("server_health", Map::new())
+            .call_management("server_health", Map::new(), CancellationToken::new())
             .await
             .expect("health");
         assert_eq!(value["count"], 0);
         assert_eq!(value["sessions"], json!([]));
     }
 
-    #[tokio::test]
-    async fn session_tool_failure_stays_is_error_false_with_error_object() {
-        let server = test_supervisor();
-        let error = server
-            .call_management("idb_open", Map::new())
-            .await
-            .expect_err("missing input_path");
-        let result = tool_result(json!({"error": error}), false);
-        assert_eq!(result.is_error, Some(false));
+    #[test]
+    fn session_tool_failure_is_a_tool_error() {
+        let result = management_tool_result(Err("missing input_path".to_string()));
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.structured_content.is_none());
         let text = result
             .content
             .first()
@@ -897,5 +853,40 @@ mod tests {
             .expect("text content");
         let value: Value = serde_json::from_str(text).expect("json error envelope");
         assert!(value.get("error").and_then(Value::as_str).is_some());
+    }
+
+    #[tokio::test]
+    async fn cancelled_management_call_stops_before_worker_start() {
+        let server = test_supervisor();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let mut arguments = Map::new();
+        arguments.insert(
+            "input_path".to_string(),
+            json!(std::env::current_exe().expect("current test executable")),
+        );
+
+        let error = server
+            .call_management("idb_open", arguments, cancel)
+            .await
+            .expect_err("cancelled open must not spawn a worker");
+
+        assert_eq!(error, "cancelled idb_open before it started");
+    }
+
+    #[tokio::test]
+    async fn cancelled_worker_call_stops_before_session_lookup() {
+        let server = test_supervisor();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let mut arguments = Map::new();
+        arguments.insert("database".to_string(), json!("missing"));
+
+        let error = server
+            .call_worker("analysis_status", arguments, cancel)
+            .await
+            .expect_err("cancelled call must not wait for a worker");
+
+        assert_eq!(error, "cancelled analysis_status before it started");
     }
 }

@@ -224,12 +224,31 @@ impl SessionManager {
         request: OpenSessionRequest,
         cancel: Option<CancellationToken>,
     ) -> Result<OpenSessionResult, ToolError> {
+        ensure_not_cancelled(cancel.as_ref(), "idb_open")?;
         validate_mode(&request.mode)?;
-        let _open_guard = self.open_lock.lock().await;
+        let _open_guard = if let Some(cancel) = cancel.as_ref() {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(cancelled_before_start("idb_open")),
+                guard = self.open_lock.lock() => guard,
+            }
+        } else {
+            self.open_lock.lock().await
+        };
+        ensure_not_cancelled(cancel.as_ref(), "idb_open")?;
         let canonical_path = canonical_input_path(&request.input_path)?;
 
         if let Some((existing_id, existing)) = self.find_by_path(&canonical_path).await {
-            let _lifecycle_guard = existing.lifecycle.lock().await;
+            let _lifecycle_guard = if let Some(cancel) = cancel.as_ref() {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Err(cancelled_before_start("idb_open")),
+                    guard = existing.lifecycle.lock() => guard,
+                }
+            } else {
+                existing.lifecycle.lock().await
+            };
+            ensure_not_cancelled(cancel.as_ref(), "idb_open")?;
             if self.is_current(&existing_id, &existing).await {
                 // Keep this check local: a worker RPC would hold `open_lock`
                 // until the operation watchdog and block unrelated opens.
@@ -445,8 +464,18 @@ impl SessionManager {
         arguments: Map<String, Value>,
         cancel: Option<CancellationToken>,
     ) -> Result<CallToolResult, ToolError> {
+        ensure_not_cancelled(cancel.as_ref(), native_tool)?;
         let session = self.get(database).await?;
-        let _lifecycle_guard = session.lifecycle.lock().await;
+        let _lifecycle_guard = if let Some(cancel) = cancel.as_ref() {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(cancelled_before_start(native_tool)),
+                guard = session.lifecycle.lock() => guard,
+            }
+        } else {
+            session.lifecycle.lock().await
+        };
+        ensure_not_cancelled(cancel.as_ref(), native_tool)?;
         // Recorded for `server_health`, which reads these without this lock.
         let active_call = session.begin_call(native_tool);
         *session.last_access.lock().await = Instant::now();
@@ -633,6 +662,21 @@ fn requested_session_id(preferred: Option<&str>) -> Result<String, ToolError> {
         ));
     }
     Ok(preferred.to_string())
+}
+
+fn cancelled_before_start(operation: &str) -> ToolError {
+    ToolError::Cancelled(format!("cancelled {operation} before it started"))
+}
+
+fn ensure_not_cancelled(
+    cancel: Option<&CancellationToken>,
+    operation: &str,
+) -> Result<(), ToolError> {
+    if cancel.is_some_and(CancellationToken::is_cancelled) {
+        Err(cancelled_before_start(operation))
+    } else {
+        Ok(())
+    }
 }
 
 async fn touch(session: &ManagedSession) -> SessionInfo {
