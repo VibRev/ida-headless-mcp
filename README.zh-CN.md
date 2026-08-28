@@ -81,20 +81,22 @@ $env:IDADIR = "C:\Program Files\IDA Professional 9.4"
 .\target\release\ida-headless-mcp.exe
 ```
 
+这会启动默认的 HTTP 监听（`127.0.0.1:8765`）并打印一段安全横幅——足以确认二进制找到了 IDA。Ctrl-C 停止。
+
 ## 配置 MCP 客户端
 
-不带子命令直接运行，等价于 `serve`：一个 stdio supervisor。把二进制放到 `PATH` 上（或使用绝对路径）后：
+MCP 客户端会拉起这个进程并通过管道对话，所以要明确指定 stdio 传输：`serve --mode stdio`。（不带参数直接运行走的是 HTTP，见 [Streamable HTTP](#streamable-http)。）把二进制放到 `PATH` 上（或使用绝对路径）后：
 
 ### Claude Code
 
 ```bash
-claude mcp add ida -- ida-headless-mcp
+claude mcp add ida -- ida-headless-mcp serve --mode stdio
 ```
 
 ### Codex CLI
 
 ```bash
-codex mcp add ida -- ida-headless-mcp
+codex mcp add ida -- ida-headless-mcp serve --mode stdio
 ```
 
 ### Cursor
@@ -106,6 +108,7 @@ codex mcp add ida -- ida-headless-mcp
   "mcpServers": {
     "ida": {
       "command": "ida-headless-mcp",
+      "args": ["serve", "--mode", "stdio"],
       "env": {
         "IDADIR": "/path/to/ida"
       }
@@ -134,7 +137,7 @@ idb_close(database: "<session_id>")
 - `input_path` 可以是原始二进制（Mach-O/ELF/PE），也可以是已有的 `.i64`/`.idb`。同一个规范化路径第二次打开会复用已存在的会话，而不是再起一个 worker。
 - 会话闲置 `idle_ttl_sec` 秒后被回收（默认 600）；传 `0` 关闭回收。
 - `idb_open` 接受 `mode` 参数：`prefer_headless`（默认）、`force_headless` 和 `prefer_gui` 都会得到无头 worker；`force_gui` 返回稳定的不支持模式错误——本构建只支持无头。
-- `--max-databases`（默认 4）限制 stdio supervisor 同时保活的 worker 进程数。
+- `--max-workers`（默认 4）限制 supervisor 同时保活的 worker 进程数，两种传输都适用，每个打开的数据库占一个。环境变量是 `IDA_MCP_MAX_WORKERS`。
 - `server_health` 不需要打开任何数据库就能报告 supervisor 状态。
 
 从旧的 `ida-pro-mcp` 兼容工具名迁移？对照表见 [docs/MIGRATION.md](docs/MIGRATION.md)。
@@ -142,7 +145,7 @@ idb_close(database: "<session_id>")
 ### Streamable HTTP
 
 ```bash
-./target/release/ida-headless-mcp serve-http --bind 127.0.0.1:8765
+./target/release/ida-headless-mcp serve --bind 127.0.0.1:8765
 ```
 
 与 stdio 不同，这条路径会开一个监听端口，因此**每个请求都必须带 bearer token**，没有关闭它的开关。token 存放在 `$VIBREV_HOME/token`，未设置该变量时是 `~/.vibrev/token`（权限 `0600`，首次使用时生成、之后长期复用）；`--token-file` 可以改位置。服务启动时会打印一段安全提示横幅和可直接粘贴的客户端配置片段：
@@ -157,7 +160,7 @@ idb_close(database: "<session_id>")
 
 当 stderr 不是终端时，片段里的 token 会被省略，避免重定向的日志和 CI 输出泄露它；需要时用 `head -n1 ~/.vibrev/token` 读回。
 
-这里控制子 worker 进程池大小的是 `--max-workers`（默认 4），不是 `--max-databases`。鉴权、Origin/Host 检查、会话保活以及其余进程池参数见 [docs/TRANSPORTS.md](docs/TRANSPORTS.md)。
+`serve` 不加 `--mode stdio` 就是 HTTP，所以上面这条命令不需要写 mode。鉴权、Origin/Host 检查、会话保活和进程池参数见 [docs/TRANSPORTS.md](docs/TRANSPORTS.md)。
 
 ### 内置 skill
 

@@ -34,7 +34,7 @@ fi
 
 tmpdir="$(mktemp -d)"
 
-# serve-http needs a bearer token. Seed a throwaway one instead of
+# serve --mode http needs a bearer token. Seed a throwaway one instead of
 # letting the server create or read the operator's real ~/.vibrev/token.
 token_file="$tmpdir/token"
 mcp_token="vbr_test_$$"
@@ -89,7 +89,7 @@ curl_headers=(
 )
 url="http://$CONNECT_HOST:$PORT/"
 
-"$BIN" serve-http --token-file "$token_file" \
+"$BIN" serve --mode http --token-file "$token_file" \
   --bind "$BIND_HOST:$PORT" \
   --allow-origin "$ALLOW_ORIGIN" \
   --max-workers "$MAX_WORKERS" \

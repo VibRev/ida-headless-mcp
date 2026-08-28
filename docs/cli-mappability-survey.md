@@ -318,7 +318,8 @@ as the one-line about is fine.
   collides with clap's built-ins or with the mapper's own `--json` / `--json-input`.
 - No `no_x`/`x` pair that would collide with the hidden half of a boolean pair.
 - No tool name collides with the real management commands
-  (`mcp`/`serve`/`serve-http`/`probe`/`worker`); `EngineCli::command()` builds
+  (`mcp`/`serve`/`serve-http`/`probe`/`worker` — `serve-http` has since merged
+into `serve --mode http`); `EngineCli::command()` builds
   without panicking. Nor would the fallback `RESERVED` list refuse any of the 78.
 - All 78 names are flat (no `.`), so the tree is one level: `ida tool <name>`.
   Worth a design decision — 78 flat subcommands under `tool` is a lot, and the

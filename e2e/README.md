@@ -51,7 +51,7 @@ just test-observability # Foreground progress/recent_operations test
 just test-elicitation # open_idb auto-background elicitation test
 ```
 
-`just test` drives the default supervisor entry over stdio with a FIFO client
+`just test` drives the supervisor over stdio (`serve --mode stdio`) with a FIFO client
 (`stdio_session.sh`). It waits for each JSON-RPC `id` before sending the next
 request, opens `fixtures/mini.i64` with `preferred_session_id: "mini"`, and
 passes `database: "mini"` on every routed tool. Address-only tools

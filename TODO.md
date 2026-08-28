@@ -24,15 +24,17 @@
 
 ## P0 —— 推之前必须解决
 
-### 1. `VibRev/vibrev` 是私有仓库，CI 取不到依赖
+### 1. ~~`VibRev/vibrev` 是私有仓库，CI 取不到依赖~~ 已解决
 
-三个 vibrev crate 是 git 依赖（`branch = "main"`，三份 lock 都锁 `214cf373`）。`actions/checkout` 的 `GITHUB_TOKEN` 只对当前仓库有效，所以 CI 会死在**认证**上。
+三个 vibrev crate 是 git 依赖（`branch = "main"`）。仓库私有时 `actions/checkout` 的 `GITHUB_TOKEN` 只对当前仓库有效，CI 会死在**认证**上。
 
-按仓库所有者的决定：**vibrev 后续转 public，届时零改动即可通过**，在那之前不给 CI 配凭据。如果最后决定不转，需要在 `verify` 和 `build` 两个 job 里加 `git config url.insteadOf` 重写加 `CARGO_NET_GIT_FETCH_WITH_CLI=true`，外加一个只读 secret。
+当时记的是「vibrev 后续转 public，届时零改动即可通过」。**它已经转 public 了**（`gh repo view VibRev/vibrev` 报 `isPrivate: false`，匿名 `git ls-remote` 能取到），所以这条不再需要任何动作。
+
+实际影响不只是「不红了」：**CI 从此是一道真门禁**。在此之前它取不到依赖，任何本地改坏的东西 CI 都发现不了。
 
 ### 2. 六个 HTTP e2e 脚本调的是 worker 面的工具名
 
-`serve-http` 只提供 **supervisor 面**（`idb_open` / `idb_close`，参数 `input_path`）。这些脚本调的是 **worker 面**的 `open_idb` / `close_idb`（参数 `path`），那两个工具在 supervisor 面根本不存在——snapshot 可查。
+HTTP 传输只提供 **supervisor 面**（`idb_open` / `idb_close`，参数 `input_path`）。这些脚本调的是 **worker 面**的 `open_idb` / `close_idb`（参数 `path`），那两个工具在 supervisor 面根本不存在——snapshot 可查。
 
 | 脚本 | recipe |
 |---|---|
@@ -43,11 +45,11 @@
 | `http_session_cancel.sh` | `just test-session-cancel` |
 | `http_bootstrap.sh` | `just test-bootstrap` |
 
-**产品没坏，是测试没跟上**：走 supervisor 名字的 `test-supervisor-http` 是通过的。这些脚本写于 `serve-http` 还在进程内提供 native 面的年代，那条拓扑已经删除。
+**产品没坏，是测试没跟上**：走 supervisor 名字的 `test-supervisor-http` 是通过的。这些脚本写于 `serve-http`（现已并入 `serve --mode http`）还在进程内提供 native 面的年代，那条拓扑已经删除。
 
 `modern_protocol.sh` 同源：它等的启动横幅是 `"MCP HTTP server listening on"` / `"MCP pooled HTTP server listening on"`，而现在只打 `"MCP supervisor listening on"`；它还断言 `tools/list` 里有 `open_idb`。
 
-> **一条被撤回的记录。** 这里一度写着「`--allow-origin` 的语义从 Origin 变成了 Host」并定为 P0 破坏性变更。**那是错的，测量方法有问题**：`serve-http` 有 `--allow-origin`（Origin 白名单，默认 `http://localhost,http://127.0.0.1`）和 `--allow-host`（额外 Host 头）两个独立的 flag，我把前者的名字和后者的说明看串了，那次「400」是自己 curl 参数写坏造成的。重测：带 `Origin: http://localhost` 是 **200**。`commit 7eed627` 的信息里留有这个错误说法。
+> **一条被撤回的记录。** 这里一度写着「`--allow-origin` 的语义从 Origin 变成了 Host」并定为 P0 破坏性变更。**那是错的，测量方法有问题**：HTTP 传输有 `--allow-origin`（Origin 白名单，默认 `http://localhost,http://127.0.0.1`）和 `--allow-host`（额外 Host 头）两个独立的 flag，我把前者的名字和后者的说明看串了，那次「400」是自己 curl 参数写坏造成的。重测：带 `Origin: http://localhost` 是 **200**。`commit 7eed627` 的信息里留有这个错误说法。
 
 ### 3. Origin 校验还关不掉，因为它在 kit 里
 

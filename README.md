@@ -84,20 +84,23 @@ $env:IDADIR = "C:\Program Files\IDA Professional 9.4"
 .\target\release\ida-headless-mcp.exe
 ```
 
+That starts the default HTTP listener on `127.0.0.1:8765` and prints a security
+banner — enough to confirm the binary found IDA. Ctrl-C to stop it.
+
 ## Configure an MCP client
 
-Running the binary with no subcommand is the same as `serve`: a stdio supervisor. After the binary is on `PATH` (or use the absolute path):
+MCP clients spawn the binary and talk over the pipe, so they need the stdio transport by name: `serve --mode stdio`. (A bare invocation serves HTTP — see [Streamable HTTP](#streamable-http).) After the binary is on `PATH` (or use the absolute path):
 
 ### Claude Code
 
 ```bash
-claude mcp add ida -- ida-headless-mcp
+claude mcp add ida -- ida-headless-mcp serve --mode stdio
 ```
 
 ### Codex CLI
 
 ```bash
-codex mcp add ida -- ida-headless-mcp
+codex mcp add ida -- ida-headless-mcp serve --mode stdio
 ```
 
 ### Cursor
@@ -109,6 +112,7 @@ Add to `.cursor/mcp.json`:
   "mcpServers": {
     "ida": {
       "command": "ida-headless-mcp",
+      "args": ["serve", "--mode", "stdio"],
       "env": {
         "IDADIR": "/path/to/ida"
       }
@@ -137,7 +141,7 @@ Notes that save a round trip:
 - `input_path` may be a raw binary (Mach-O/ELF/PE) or an existing `.i64`/`.idb`. Opening the same canonical path twice returns the session that already exists instead of a second worker.
 - Sessions are reaped after `idle_ttl_sec` seconds idle (default 600); pass `0` to disable.
 - `idb_open` takes a `mode`: `prefer_headless` (default), `force_headless`, and `prefer_gui` all yield a headless worker; `force_gui` returns a stable unsupported-mode error, because this build is headless-only.
-- `--max-databases` (default 4) caps how many worker processes the stdio supervisor keeps alive at once.
+- `--max-workers` (default 4) caps how many worker processes the supervisor keeps alive at once, on either transport — one per open database. `IDA_MCP_MAX_WORKERS` is the env spelling.
 - `server_health` reports on the supervisor without touching a database.
 
 Coming from the previous `ida-pro-mcp`-compatible tool names? See the mapping table in [docs/MIGRATION.md](docs/MIGRATION.md).
@@ -145,7 +149,7 @@ Coming from the previous `ida-pro-mcp`-compatible tool names? See the mapping ta
 ### Streamable HTTP
 
 ```bash
-./target/release/ida-headless-mcp serve-http --bind 127.0.0.1:8765
+./target/release/ida-headless-mcp serve --bind 127.0.0.1:8765
 ```
 
 Unlike stdio, this opens a listener, so **every request needs a bearer token** — there is no flag that turns it off. The token lives in `$VIBREV_HOME/token`, or `~/.vibrev/token` when that is unset (mode `0600`, generated on first use and reused afterwards); `--token-file` moves it. On startup the server prints a security banner and a paste-able client-config snippet:
@@ -160,7 +164,7 @@ Unlike stdio, this opens a listener, so **every request needs a bearer token** �
 
 The token is elided from that snippet when stderr is not a terminal, so redirected logs and CI output do not leak it; read it back with `head -n1 ~/.vibrev/token`.
 
-Here `--max-workers` (default 4) — not `--max-databases` — sizes the child worker pool. See [docs/TRANSPORTS.md](docs/TRANSPORTS.md) for authentication, Origin/Host checks, session keep-alive, and the rest of the pool flags.
+HTTP is what `serve` does unless you pass `--mode stdio`, so the command above needs no mode. See [docs/TRANSPORTS.md](docs/TRANSPORTS.md) for authentication, Origin/Host checks, session keep-alive, and the pool flags.
 
 ### Bundled skills
 

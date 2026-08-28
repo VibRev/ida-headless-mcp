@@ -19,7 +19,7 @@ fi
 
 tmpdir="$(mktemp -d)"
 
-# serve-http needs a bearer token. This script never sends a request,
+# serve --mode http needs a bearer token. This script never sends a request,
 # but the servers it starts still need one, and pointing them at a throwaway
 # file keeps them from creating the operator's real ~/.vibrev/token.
 token_file="$tmpdir/token"
@@ -66,7 +66,7 @@ run_bounded() {
 }
 
 # --- Squat the port. A pooled parent binds in milliseconds and takes no license.
-"$BIN" serve-http --bind "$BIND_HOST:$PORT" --token-file "$token_file" --max-workers 2 --min-workers 0 \
+"$BIN" serve --mode http --bind "$BIND_HOST:$PORT" --token-file "$token_file" --max-workers 2 --min-workers 0 \
   >"$tmpdir/squatter.log" 2>&1 &
 squatter_pid=$!
 
@@ -86,7 +86,7 @@ echo "   port $PORT squatted"
 # --- Phase 1: single-worker must exit nonzero and must not wedge.
 single_log="$tmpdir/single-worker.log"
 single_rc="$(run_bounded "$single_log" "$WATCHDOG_SECS" \
-  "$BIN" serve-http --bind "$BIND_HOST:$PORT" --token-file "$token_file")"
+  "$BIN" serve --mode http --bind "$BIND_HOST:$PORT" --token-file "$token_file")"
 
 [[ "$single_rc" != "137" ]] ||
   fail "single-worker start WEDGED on an occupied port (watchdog SIGKILL after ${WATCHDOG_SECS}s)" \
@@ -99,7 +99,7 @@ single_rc="$(run_bounded "$single_log" "$WATCHDOG_SECS" \
 grep -Fq "cannot bind" "$single_log" ||
   fail "single-worker log never mentions the bind failure" "$(cat "$single_log")"
 # A start that cannot bind must not take an IDA licence in the first place.
-# There is no wedge left to detect here: `serve-http` dispatches to the
+# There is no wedge left to detect here: `serve --mode http` dispatches to the
 # supervisor and never calls `run_ida_loop` — only `worker` does — so a parked
 # main thread is structurally impossible, and the watchdog check above is what
 # proves the process died on its own. This line is what keeps the licence half
@@ -112,7 +112,7 @@ echo "   single-worker exited $single_rc without taking an IDA licence"
 # --- Phase 2: pooled must exit nonzero and must not claim a clean stop.
 pooled_log="$tmpdir/pooled.log"
 pooled_rc="$(run_bounded "$pooled_log" "$WATCHDOG_SECS" \
-  "$BIN" serve-http --bind "$BIND_HOST:$PORT" --token-file "$token_file" --max-workers 2 --min-workers 0)"
+  "$BIN" serve --mode http --bind "$BIND_HOST:$PORT" --token-file "$token_file" --max-workers 2 --min-workers 0)"
 
 [[ "$pooled_rc" != "137" ]] ||
   fail "pooled start hung on an occupied port" "$(cat "$pooled_log")"

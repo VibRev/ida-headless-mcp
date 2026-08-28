@@ -74,11 +74,12 @@ under `sdk/ida-92/target/release` and `sdk/ida-93/target/release`
 respectively. Windows adds the `.exe` suffix.
 
 ```bash
-# Stdio supervisor
+# Streamable HTTP supervisor (the default; no arguments needed for loopback)
 ./target/release/ida-headless-mcp
+./target/release/ida-headless-mcp serve --bind 127.0.0.1:8745
 
-# Streamable HTTP supervisor
-./target/release/ida-headless-mcp serve-http --bind 127.0.0.1:8745
+# Stdio supervisor — what an MCP client spawns
+./target/release/ida-headless-mcp serve --mode stdio
 
 # Direct IDA probe
 ./target/release/ida-headless-mcp probe --path /path/to/binary --list 10

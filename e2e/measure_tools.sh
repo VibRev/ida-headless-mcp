@@ -36,7 +36,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-"$BIN" < "$fifo" > "$log" 2>&1 &
+"$BIN" serve --mode stdio < "$fifo" > "$log" 2>&1 &
 pid=$!
 exec 3>"$fifo"
 

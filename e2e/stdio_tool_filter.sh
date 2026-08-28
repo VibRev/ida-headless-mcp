@@ -36,7 +36,7 @@ start_server() {
   rm -f "$fifo"
   mkfifo "$fifo"
   : > "$log"
-  "$BIN" serve "$@" < "$fifo" > "$log" 2>&1 &
+  "$BIN" serve --mode stdio "$@" < "$fifo" > "$log" 2>&1 &
   pid=$!
   exec 3>"$fifo"
 }
@@ -115,16 +115,18 @@ if echo "$names" | grep -q '^analysis_status$'; then
 fi
 echo "   ✓ env vars mirror flags"
 
-# --- Phase B2: env-var mirror also applies to the default stdio command ---
-# Most installed-client configs run `ida-headless-mcp` directly, relying on
-# the default stdio server path instead of spelling out an explicit `serve`.
-echo "── Phase B2: env-var mirror on default command (no explicit serve) ──"
+# --- Phase B2: env-var mirror also applies to the stdio transport ---
+# An installed client spawns this binary and speaks JSON-RPC over the pipe, so
+# its config names `serve --mode stdio`. The bare invocation used to mean the
+# same thing and no longer does — the default transport is HTTP — which is why
+# the filter has to be proven on the flag that clients actually pass.
+echo "── Phase B2: env-var mirror on the stdio transport ──"
 cleanup_stale_pid
 pid=
 rm -f "$fifo"
 mkfifo "$fifo"
 : > "$log"
-IDA_MCP_TOOLSETS=decompile "$BIN" < "$fifo" > "$log" 2>&1 &
+IDA_MCP_TOOLSETS=decompile "$BIN" serve --mode stdio < "$fifo" > "$log" 2>&1 &
 pid=$!
 exec 3>"$fifo"
 initialize
@@ -140,19 +142,21 @@ echo "$names" | grep -q '^idb_open$' || {
   echo "FAIL: session primitives must survive any toolset" >&2
   exit 1
 }
-echo "   ✓ env vars apply without explicit serve"
+echo "   ✓ env vars apply on the stdio transport"
 
-# --- Phase B3: filter FLAGS also apply on the default stdio command ---
+# --- Phase B3: filter FLAGS survive the same trip ---
 # Regression for https://github.com/blacktop/ida-mcp-rs/...: clap rejected
-# `--toolsets=core` because the flag was only defined on serve/serve-http
-# subcommands. With the global=true fix on Cli, this should now parse and run.
-echo "── Phase B3: filter flag on default command (no explicit serve) ──"
+# `--toolsets=core` because the flag was only defined on the serve subcommands.
+# The policy flags are `global = true` on `Cli` and must stay that way — note
+# they are passed *before* the subcommand here, which is what global buys and
+# what the `tool` subtree also depends on.
+echo "── Phase B3: filter flag before the subcommand ──"
 cleanup_stale_pid
 pid=
 rm -f "$fifo"
 mkfifo "$fifo"
 : > "$log"
-"$BIN" --toolsets=core --exclude-tools=analysis_status < "$fifo" > "$log" 2>&1 &
+"$BIN" --toolsets=core --exclude-tools=analysis_status serve --mode stdio < "$fifo" > "$log" 2>&1 &
 pid=$!
 exec 3>"$fifo"
 initialize
@@ -168,7 +172,7 @@ if echo "$names" | grep -q '^decompile$'; then
   echo "FAIL: default-command --toolsets=core should not expose decompile" >&2
   exit 1
 fi
-echo "   ✓ filter flags apply without explicit serve"
+echo "   ✓ filter flags apply when passed before the subcommand"
 
 # --- Phase B4: bool-like env values for IDA_MCP_READ_ONLY ---
 echo "── Phase B4: IDA_MCP_READ_ONLY accepts 1/0 env values ──"
@@ -222,7 +226,7 @@ echo "   ✓ flags override env vars"
 
 # --- Phase D: startup must reject unknown toolset ---
 echo "── Phase D: startup rejects unknown toolset name ──"
-if "$BIN" serve --toolsets=not_a_real_category < /dev/null > "$work/bad.log" 2>&1; then
+if "$BIN" serve --mode stdio --toolsets=not_a_real_category < /dev/null > "$work/bad.log" 2>&1; then
   echo "FAIL: startup should reject unknown toolset" >&2
   cat "$work/bad.log" >&2
   exit 1

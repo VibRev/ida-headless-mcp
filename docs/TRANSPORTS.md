@@ -1,13 +1,24 @@
 # Transports
 
-## Stdio (default)
+One command, two transports: `serve --mode http` (the default) and
+`serve --mode stdio`. Both run the same supervisor over the same pool of child
+`worker` processes; only the framing differs. Flags that describe the pool are
+shared; flags that describe a listener are refused under `--mode stdio` rather
+than silently ignored.
+
+## Stdio
 
 - Single-client, simplest setup.
-- Use with CLI agents that launch a child process.
+- Use with CLI agents that launch a child process — this is what an installed
+  MCP client's config should name.
 
 ```bash
-./target/release/ida-headless-mcp
+./target/release/ida-headless-mcp serve --mode stdio
 ```
+
+A bare `ida-headless-mcp` does not mean this. It serves HTTP on
+`127.0.0.1:8765`, so a client that spawns it and waits on the pipe will wait
+forever.
 
 ### Progress observability
 
@@ -25,10 +36,12 @@ catalog that stdio and HTTP serve; reach it through the `worker` subcommand.)
 
 ## Streamable HTTP (multi-client transport)
 
+- The default transport: `serve`, `serve --mode http` and a bare
+  `ida-headless-mcp` all land here.
 - Supports multiple clients over HTTP.
-- `serve-http` always runs the supervisor over a pool of child `worker`
-  processes. There is no in-process HTTP topology: the command never enters an
-  IDA worker loop itself, so a failed bind cannot strand a licence.
+- The supervisor always runs over a pool of child `worker` processes. There is
+  no in-process HTTP topology: the command never enters an IDA worker loop
+  itself, so a failed bind cannot strand a licence.
 - Each open database leases its own child worker, so different sessions can
   analyse different IDBs concurrently. `--max-workers` (default 4) caps how
   many exist at once.
@@ -42,21 +55,25 @@ catalog that stdio and HTTP serve; reach it through the `worker` subcommand.)
   the bind address are then accepted automatically.
 
 ```bash
-./target/release/ida-headless-mcp serve-http --bind 127.0.0.1:8765
+# The default: no arguments needed for a loopback listener
+./target/release/ida-headless-mcp
+
+# Same thing, spelled out
+./target/release/ida-headless-mcp serve --mode http --bind 127.0.0.1:8765
 
 # Concurrent multi-IDB sessions
-./target/release/ida-headless-mcp serve-http \
+./target/release/ida-headless-mcp serve \
   --bind 127.0.0.1:8765 \
   --max-workers 4 \
   --min-workers 1
 
 # Exposing on a LAN by IP address
-./target/release/ida-headless-mcp serve-http \
+./target/release/ida-headless-mcp serve \
   --bind 0.0.0.0:8765 \
   --allow-origin http://10.0.0.5:8765
 
 # Exposing on a LAN by DNS name
-./target/release/ida-headless-mcp serve-http \
+./target/release/ida-headless-mcp serve \
   --bind 0.0.0.0:8765 \
   --allow-host ida-box.local \
   --allow-origin http://ida-box.local:8765
@@ -86,24 +103,29 @@ Options:
 - `--session-keep-alive-secs`: HTTP session inactivity timeout (default 1800s;
   0 disables). This is the fallback reclaim for POST-only clients — SSE clients
   are reclaimed faster via `--worker-disconnect-grace-secs`.
-- `--max-workers`: maximum child worker processes for concurrent multi-IDB
-  sessions (default 4); `1` still uses a child process, it just serializes
-  every session behind that one
+The four below describe the worker pool, so they apply to **both** transports.
+
+- `--max-workers`: maximum child worker processes, one per open database
+  (default 4); `1` still uses a child process, it just serializes every session
+  behind that one
 - `--min-workers`: idle child workers to keep warm (default 0)
 - `--worker-idle-timeout-secs`: seconds before an idle worker process is
   reaped (default 300s; 0 disables)
 - `--worker-op-timeout-secs`: per-child operation watchdog (default 1800s).
   The parent kills a child that exceeds it; this guards against wedged
   workers, not normal long analysis.
+
+HTTP only — there is no stream to lose on stdio, so `--mode stdio` refuses it:
+
 - `--worker-disconnect-grace-secs`: reconnect grace before a session is closed
   after the client drops its standalone SSE stream (default 2s)
 
 ## Authentication
 
-`serve-http` requires `Authorization: Bearer <token>` on every request. There
-is no flag to disable it. Stdio (`serve`, the default) is unaffected: the
-client spawns the process directly, so there is no listener to reach and no
-token involved.
+HTTP — which is what `serve` does unless told otherwise — requires
+`Authorization: Bearer <token>` on every request. There is no flag to disable
+it. `serve --mode stdio` is unaffected: the client spawns the process directly,
+so there is no listener to reach and no token involved.
 
 **Why unconditional, even on loopback.** What the endpoint exposes is opening
 any file on the host as a database — reading arbitrary files is what this tool
@@ -129,7 +151,7 @@ client stranded. To rotate by hand: stop the server, put the new token on the
 first line and leave the old one on the second, restart, update your clients,
 then delete the old line and restart again.
 
-**Configuring a client.** `serve-http` prints a paste-able snippet on startup.
+**Configuring a client.** The HTTP listener prints a paste-able snippet on startup.
 The token itself is only spelled out when stderr is a terminal; redirected to a
 log file it is elided, and the banner tells you how to read it:
 
@@ -252,3 +274,4 @@ whole JSON-RPC envelopes — including tool arguments — to stderr.
 
 The server listens for SIGINT/SIGTERM/SIGQUIT and will close the open database
 before exiting when possible.
+

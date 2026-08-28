@@ -28,8 +28,8 @@ explicitly. Running a script from `e2e/` by hand is the case that needs
 `e2e/justfile`. Override either with `MCP_BIN`; see `e2e/README.md` for the full
 resolution order.
 
-The default entry point is the supervisor, so stdio payloads open a session
-with `idb_open` (using a fixed `preferred_session_id`) and pass that ID as
+The stdio scripts run `serve --mode stdio`, which is the supervisor, so their
+payloads open a session with `idb_open` (using a fixed `preferred_session_id`) and pass that ID as
 `database` on every routed tool. Tests that exercise native tool behaviour
 directly — `test-decompile`, `test-rebuild-idb`, `test-elicitation`,
 `test-callees-indirect`, `test-dsc` — drive the `worker` subcommand, which
@@ -82,7 +82,7 @@ serves the native surface without session routing.
 
 **Startup-failure test** (`just test-http-startup`)
 - Squats a port with a supervisor parent (binds in ms, takes no IDA license),
-  then starts `serve-http` against it with default flags and again with
+  then starts `serve --mode http` against it with default flags and again with
   explicit `--max-workers`
 - Asserts each start exits nonzero, does not wedge (watchdog SIGKILL would show
   as 137), and never logs "Initializing IDA library" — a start that cannot bind

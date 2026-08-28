@@ -20,7 +20,7 @@ fi
 
 tmpdir="$(mktemp -d)"
 
-# serve-http needs a bearer token. Seed a throwaway one instead of
+# serve --mode http needs a bearer token. Seed a throwaway one instead of
 # letting the server create or read the operator's real ~/.vibrev/token.
 token_file="$tmpdir/token"
 mcp_token="vbr_test_$$"
@@ -101,7 +101,7 @@ run_stdio_modern() {
   mkfifo "$fifo"
   # JSON-RPC stdout and tracing stderr must not share a file offset: a trace
   # line flushed mid-response tears the response line in the log for good.
-  RUST_LOG="${RUST_LOG:-ida_mcp=info}" "$BIN" <"$fifo" >"$log" 2>"$log.err" &
+  RUST_LOG="${RUST_LOG:-ida_mcp=info}" "$BIN" serve --mode stdio <"$fifo" >"$log" 2>"$log.err" &
   server_pid=$!
   exec 3>"$fifo"
 
@@ -145,7 +145,7 @@ run_stdio_legacy_owner() {
   local fifo="$tmpdir/legacy-stdio.fifo"
   local log="$tmpdir/legacy-stdio.log"
   mkfifo "$fifo"
-  RUST_LOG="${RUST_LOG:-ida_mcp=info}" "$BIN" <"$fifo" >"$log" 2>"$log.err" &
+  RUST_LOG="${RUST_LOG:-ida_mcp=info}" "$BIN" serve --mode stdio <"$fifo" >"$log" 2>"$log.err" &
   server_pid=$!
   exec 3>"$fifo"
 
@@ -246,7 +246,7 @@ run_http_modern() {
   local url="http://127.0.0.1:$PORT/"
   local log="$tmpdir/http-server.log"
   local discover="{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"server/discover\",\"params\":{\"_meta\":$META}}"
-  RUST_LOG="${RUST_LOG:-info},ida_mcp=info" "$BIN" serve-http --bind "127.0.0.1:$PORT" --token-file "$token_file" \
+  RUST_LOG="${RUST_LOG:-info},ida_mcp=info" "$BIN" serve --mode http --bind "127.0.0.1:$PORT" --token-file "$token_file" \
     --allow-origin "http://localhost,http://127.0.0.1" >"$log" 2>&1 &
   server_pid=$!
   wait_http "$url" "$discover" "2026-07-28" "server/discover" \
@@ -288,7 +288,7 @@ run_pooled_boundary() {
   local log="$tmpdir/http-server.log"
   local legacy_meta='{"io.modelcontextprotocol/protocolVersion":"2025-11-25","io.modelcontextprotocol/clientInfo":{"name":"ida-mcp-modern-test","version":"0.1"},"io.modelcontextprotocol/clientCapabilities":{}}'
   local discover="{\"jsonrpc\":\"2.0\",\"id\":20,\"method\":\"server/discover\",\"params\":{\"_meta\":$legacy_meta}}"
-  RUST_LOG="${RUST_LOG:-info},ida_mcp=info" "$BIN" serve-http --bind "127.0.0.1:$pooled_port" --token-file "$token_file" --max-workers 2 \
+  RUST_LOG="${RUST_LOG:-info},ida_mcp=info" "$BIN" serve --mode http --bind "127.0.0.1:$pooled_port" --token-file "$token_file" --max-workers 2 \
     --allow-origin "http://localhost,http://127.0.0.1" >"$log" 2>&1 &
   server_pid=$!
   wait_http "$url" "$discover" "2025-11-25" "server/discover" \

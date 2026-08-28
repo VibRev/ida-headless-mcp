@@ -22,7 +22,7 @@ fi
 
 tmpdir="$(mktemp -d)"
 
-# serve-http needs a bearer token. Seed a throwaway one instead of
+# serve --mode http needs a bearer token. Seed a throwaway one instead of
 # letting the server create or read the operator's real ~/.vibrev/token.
 token_file="$tmpdir/token"
 mcp_token="vbr_test_$$"
@@ -41,7 +41,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-server_args=(serve-http --bind "$BIND_HOST:$PORT" --allow-origin "$ALLOW_ORIGIN" --token-file "$token_file")
+server_args=(serve --mode http --bind "$BIND_HOST:$PORT" --allow-origin "$ALLOW_ORIGIN" --token-file "$token_file")
 if [[ -n "${MCP_HTTP_ALLOW_HOST+x}" ]]; then
   server_args+=(--allow-host "$MCP_HTTP_ALLOW_HOST")
 fi

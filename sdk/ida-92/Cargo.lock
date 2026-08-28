@@ -666,7 +666,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1407,7 +1407,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1690,7 +1690,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1951,7 +1951,7 @@ dependencies = [
  "getrandom",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2236,7 +2236,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vibrev-kit"
 version = "0.0.1"
-source = "git+https://github.com/VibRev/vibrev.git?branch=main#214cf37311c532f95553892e71c1e4f14a4d5a06"
+source = "git+https://github.com/VibRev/vibrev.git?branch=main#f556c50cc8620486247ef2ce9dd39a5142f8583c"
 dependencies = [
  "axum",
  "bytes",
@@ -2256,7 +2256,7 @@ dependencies = [
 [[package]]
 name = "vibrev-skills"
 version = "0.0.1"
-source = "git+https://github.com/VibRev/vibrev.git?branch=main#214cf37311c532f95553892e71c1e4f14a4d5a06"
+source = "git+https://github.com/VibRev/vibrev.git?branch=main#f556c50cc8620486247ef2ce9dd39a5142f8583c"
 dependencies = [
  "anyhow",
  "clap",
@@ -2268,7 +2268,7 @@ dependencies = [
 [[package]]
 name = "vibrev-tool-macros"
 version = "0.0.1"
-source = "git+https://github.com/VibRev/vibrev.git?branch=main#214cf37311c532f95553892e71c1e4f14a4d5a06"
+source = "git+https://github.com/VibRev/vibrev.git?branch=main#f556c50cc8620486247ef2ce9dd39a5142f8583c"
 dependencies = [
  "darling",
  "proc-macro2",
@@ -2349,7 +2349,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

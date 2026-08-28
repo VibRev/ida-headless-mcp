@@ -29,7 +29,7 @@ use rmcp::ServiceExt;
 use std::ffi::OsString;
 use std::io::IsTerminal;
 use std::net::SocketAddr;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -53,33 +53,15 @@ const REQUEST_QUEUE_CAPACITY: usize = 64;
 struct Cli {
     #[command(flatten)]
     ida_network: IdaNetworkArgs,
-    /// Enable arbitrary-code and stateful diff tools.
-    #[arg(
-        long = "unsafe",
-        env = "IDA_MCP_UNSAFE",
-        global = true,
-        value_parser = clap::builder::BoolishValueParser::new()
-    )]
-    unsafe_tools: bool,
-    /// Maximum simultaneous IDA database worker processes.
-    #[arg(
-        long = "max-databases",
-        env = "IDA_MCP_MAX_WORKERS",
-        default_value = "4",
-        global = true
-    )]
-    max_databases: NonZeroUsize,
     #[command(subcommand)]
     command: Option<Command>,
 }
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run the MCP server (default)
-    Serve,
-    /// Run the MCP server over Streamable HTTP (SSE)
-    ServeHttp(ServeHttpArgs),
-    /// Run a child worker for the HTTP process pool
+    /// Run the MCP server (default; HTTP unless --mode stdio)
+    Serve(ServeArgs),
+    /// Run a child worker for the server's process pool
     #[command(hide = true)]
     Worker(WorkerArgs),
     /// Run a direct CLI probe to exercise idalib
@@ -89,8 +71,10 @@ enum Command {
 }
 
 // Tool filter flags. Defined at the top level with `global = true` so they
-// work on the default stdio invocation (`ida-mcp --toolsets=core`) as well
-// as on `ida-mcp serve …` and `ida-mcp serve-http …`.
+// work on a bare `ida-mcp --toolsets=core` as well as on `ida-mcp serve …`,
+// and so the `tool` subtree sees them too. This is what separates them from
+// `serve`'s own flags, which no other command reads and which are therefore
+// not global.
 //
 // Compose order (locked): no include flags → all tools; otherwise the
 // union of `--toolsets` and `--tools`; then `--exclude-tools`; then
@@ -155,31 +139,101 @@ impl IdaNetworkArgs {
     }
 }
 
-/// The pool knobs. Everything about the *listener* — bind, token, Origin/Host,
-/// framing, body cap — comes from `vibrev_kit::transport::HttpOptions`, which
-/// [`http_options`] hangs on this subcommand as plain `Arg`s. Those are shared
-/// with `bn-headless-mcp` so that two engines cannot spell `--bind` two ways;
-/// the five below are about child IDA processes and belong to this engine.
-#[derive(Args)]
-struct ServeHttpArgs {
-    /// Maximum child worker processes the HTTP pool may run. Each open database
-    /// holds one for its whole session, so this also caps concurrent databases:
+/// Which transport `serve` speaks.
+///
+/// Both arms run the same supervisor over the same pool of child `worker`
+/// processes; only the framing differs.
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[value(rename_all = "lowercase")]
+enum ServeMode {
+    /// Streamable HTTP (SSE) on a listening socket.
+    #[default]
+    Http,
+    /// JSON-RPC over this process's stdin/stdout.
+    Stdio,
+}
+
+/// `serve`'s own arguments: the transport, and the pool of child IDA processes
+/// behind it.
+///
+/// None of this is `global`, and that is the rule rather than an oversight —
+/// `probe`, `worker` and the derived `tool` commands read none of it. The flags
+/// that *are* global (`--allow-lumina`, the policy set) are exactly the ones
+/// those commands do read.
+///
+/// The listener knobs — bind, token, Origin/Host, framing, body cap — are not
+/// here either. They come from `vibrev_kit::transport::HttpOptions`, which
+/// [`http_options`] hangs on this same subcommand as plain `Arg`s; those names
+/// are shared with `bn-headless-mcp` so two engines cannot spell `--bind` two
+/// ways. What is below is about child IDA processes and belongs to this engine.
+#[derive(Args, Debug, Clone)]
+struct ServeArgs {
+    /// Transport to serve on.
+    #[arg(long, value_enum, default_value_t = ServeMode::Http)]
+    mode: ServeMode,
+    /// Enable arbitrary-code and stateful diff tools.
+    #[arg(
+        long = "unsafe",
+        env = "IDA_MCP_UNSAFE",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    unsafe_tools: bool,
+    /// Maximum child worker processes. One open database holds one worker for
+    /// its whole session, so this is also the cap on simultaneous databases:
     /// past it, idb_open fails rather than queueing.
-    #[arg(long, default_value_t = 4)]
-    max_workers: usize,
-    /// Minimum idle child worker processes to keep warm in pooled mode.
+    #[arg(long = "max-workers", env = "IDA_MCP_MAX_WORKERS", default_value = "4")]
+    max_workers: NonZeroUsize,
+    /// Minimum idle child worker processes to keep warm.
     #[arg(long, default_value_t = 0)]
     min_workers: usize,
-    /// Seconds before an idle pooled worker is reaped (0 disables reaping).
+    /// Seconds before an idle worker process is reaped (0 disables reaping).
     #[arg(long, default_value_t = 300)]
     worker_idle_timeout_secs: u64,
     /// Per-child operation watchdog in seconds; the parent kills a child that
     /// exceeds it. This is a wedged-process safety net, not a UX deadline.
-    #[arg(long, default_value_t = 1800)]
-    worker_op_timeout_secs: u64,
-    /// Grace period before pooled sessions are closed after a client stream disconnects.
+    #[arg(long, default_value = "1800")]
+    worker_op_timeout_secs: NonZeroU64,
+    /// Grace period before sessions are closed after a client stream
+    /// disconnects. HTTP only — stdio has no stream to lose.
     #[arg(long, default_value_t = 2)]
     worker_disconnect_grace_secs: u64,
+}
+
+impl ServeArgs {
+    /// The one pool invariant clap cannot express.
+    ///
+    /// The other two it can, and now does: `--max-workers` is a
+    /// `NonZeroUsize` and `--worker-op-timeout-secs` a `NonZeroU64`, so the
+    /// hand-rolled "must be at least 1" checks these used to need are gone.
+    fn validate_pool(&self) -> anyhow::Result<()> {
+        if self.min_workers > self.max_workers.get() {
+            return Err(anyhow::anyhow!(
+                "--min-workers ({}) cannot exceed --max-workers ({})",
+                self.min_workers,
+                self.max_workers
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Default for ServeArgs {
+    /// The bare invocation (`ida-headless-mcp` with no subcommand) does not go
+    /// through clap's subcommand parsing, so it needs these values from
+    /// somewhere. Taking them from clap itself — rather than repeating the
+    /// literals here — is what stops `ida-headless-mcp` and
+    /// `ida-headless-mcp serve` from drifting into two different defaults.
+    fn default() -> Self {
+        use clap::Parser as _;
+
+        #[derive(Parser)]
+        struct Bare {
+            #[command(flatten)]
+            serve: ServeArgs,
+        }
+
+        Bare::parse_from(["serve"]).serve
+    }
 }
 
 #[derive(Args)]
@@ -224,12 +278,20 @@ struct ProbeArgs {
 /// The kit checks every derived tool name against exactly this list, so it has
 /// to match the `Command` enum above rather than the kit's `RESERVED` guess —
 /// which names `serve` and `mcp` and `status` and knows nothing about
-/// `serve-http`, `worker` or `probe`.
-const MANAGEMENT_COMMANDS: &[&str] = &["serve", "serve-http", "worker", "probe", "skills"];
+/// `worker` or `probe`.
+///
+/// Defined in the library so the library's tests read the same list; see the
+/// note there on what happened when they each kept a copy.
+use ida_mcp::MANAGEMENT_COMMANDS;
 
-/// The one command that opens a listener, named once so `cli_command` and
+/// The one command that can open a listener, named once so `cli_command` and
 /// `main` cannot disagree about where the kit's flags were hung.
-const SERVE_HTTP_COMMAND: &str = "serve-http";
+///
+/// Getting this wrong is the quiet failure in this file: `HttpOptions::read`
+/// uses `try_get_*` throughout, so reading the wrong level of `ArgMatches`
+/// yields every default rather than an error — a listener on 127.0.0.1:8765
+/// that looks entirely intentional.
+const SERVE_COMMAND: &str = "serve";
 
 /// Graft the derived tool tree onto the derive-generated root.
 ///
@@ -264,6 +326,46 @@ fn http_options() -> Vec<clap::Arg> {
         .collect()
 }
 
+/// Refuse a listener flag that `--mode stdio` cannot honour.
+///
+/// The alternative is what this refactor exists to remove: a flag that parses,
+/// reads as configuration, and does nothing. `--max-databases` spent its whole
+/// life being ignored under `serve-http` for exactly that reason.
+///
+/// Only `ValueSource::CommandLine` counts. An env var is usually set once for a
+/// whole environment, and aborting a server that would otherwise run because
+/// `IDA_MCP_TOKEN_FILE` is exported somewhere is an overreaction — the flag was
+/// not aimed at this invocation.
+fn reject_listener_flags_on_stdio(serve: Option<&clap::ArgMatches>) -> anyhow::Result<()> {
+    // A bare invocation never enters `serve`, and it cannot reach stdio anyway.
+    let Some(serve) = serve else {
+        return Ok(());
+    };
+    let given = |id: &str| serve.value_source(id) == Some(clap::parser::ValueSource::CommandLine);
+    // Read out of the kit's own `Arg` set rather than a list kept here, so a
+    // listener flag the kit adds later cannot slip past by being unknown to us.
+    let mut named: Vec<String> = http_options()
+        .iter()
+        .filter(|arg| given(arg.get_id().as_str()))
+        .filter_map(|arg| arg.get_long().map(|long| format!("--{long}")))
+        .collect();
+    // Ours, not the kit's: a disconnect grace period needs a stream to lose.
+    if given("worker_disconnect_grace_secs") {
+        named.push("--worker-disconnect-grace-secs".to_string());
+    }
+    if named.is_empty() {
+        return Ok(());
+    }
+    named.sort();
+    Err(anyhow::anyhow!(
+        "{} {} no meaning with --mode stdio (there is no listener to configure); \
+         drop {} or run --mode http",
+        named.join(", "),
+        if named.len() == 1 { "has" } else { "have" },
+        if named.len() == 1 { "it" } else { "them" },
+    ))
+}
+
 fn cli_command() -> clap::Command {
     let derived = IdaMcpServer::vibrev_cli("ida-headless-mcp")
         .with_management(MANAGEMENT_COMMANDS)
@@ -275,9 +377,7 @@ fn cli_command() -> clap::Command {
         .clone();
     let cmd = <Cli as clap::CommandFactory>::command()
         .args(policy_args())
-        .mut_subcommand(SERVE_HTTP_COMMAND, |serve_http| {
-            serve_http.args(http_options())
-        })
+        .mut_subcommand(SERVE_COMMAND, |serve| serve.args(http_options()))
         .subcommand(tools);
     // `with_management` only feeds the collision check, which runs before this
     // Parser tree is grafted on. The closed loop is here: declared names and
@@ -313,42 +413,47 @@ fn main() -> anyhow::Result<()> {
             .map(Arc::new)
             .map_err(|e| anyhow::anyhow!("invalid tool filter: {e}"))
     };
-    let build_supervisor_filter = || {
+    let build_supervisor_filter = |unsafe_tools: bool| {
         let policy = ida_mcp::supervisor::supervisor_policy(&selection)
             .map_err(|e| anyhow::anyhow!("invalid supervisor tool filter: {e}"))?;
         // The unsafe gate is a second door this engine keeps outside the policy;
         // only their interaction can leave the catalog empty.
-        ida_mcp::supervisor::validate_unsafe_gate(&policy, cli.unsafe_tools)
+        ida_mcp::supervisor::validate_unsafe_gate(&policy, unsafe_tools)
             .map_err(|e| anyhow::anyhow!("invalid supervisor tool filter: {e}"))?;
         Ok::<_, anyhow::Error>(Arc::new(policy))
     };
     let allow_lumina = cli.ida_network.allow_lumina;
     let worker_args = cli.ida_network.worker_args();
-    let unsafe_tools = cli.unsafe_tools;
-    let max_workers = cli.max_databases.get();
-    match cli.command.unwrap_or(Command::Serve) {
-        Command::Serve => run_supervisor_stdio(
-            max_workers,
-            unsafe_tools,
-            build_supervisor_filter()?,
-            worker_args,
-        ),
-        Command::ServeHttp(args) => {
-            // The listener flags live on the subcommand, not the root: they mean
-            // nothing to `serve` or `tool`, so unlike the policy flags they are
-            // not `global(true)` and have to be read from that level.
-            let http = vibrev_kit::transport::HttpOptions::read(
-                matches
-                    .subcommand_matches(SERVE_HTTP_COMMAND)
-                    .expect("this arm was reached through that subcommand"),
-            );
-            run_supervisor_http(
-                args,
-                http,
-                unsafe_tools,
-                build_supervisor_filter()?,
-                worker_args,
-            )
+    match cli
+        .command
+        .unwrap_or_else(|| Command::Serve(ServeArgs::default()))
+    {
+        Command::Serve(args) => {
+            // The listener flags hang on `serve`, not on the root: they mean
+            // nothing to `probe`, `worker` or `tool`, so unlike the policy flags
+            // they are not `global(true)` and have to be read from that level.
+            //
+            // A bare invocation never enters the subcommand, so there is no such
+            // level to read — it gets the defaults, which is the whole contract:
+            // bare means "a working listener with nothing configured", and
+            // configuring anything means writing `serve`.
+            let serve_matches = matches.subcommand_matches(SERVE_COMMAND);
+            let http = match serve_matches {
+                Some(leaf) => vibrev_kit::transport::HttpOptions::read(leaf),
+                // Spelled out rather than passing the root matches to `read`:
+                // that would also produce the defaults, but only because the
+                // root never registered these flags — an accident that reads
+                // like a decision. This says the decision.
+                None => vibrev_kit::transport::HttpOptions::default(),
+            };
+            let filter = build_supervisor_filter(args.unsafe_tools)?;
+            match args.mode {
+                ServeMode::Http => run_supervisor_http(args, http, filter, worker_args),
+                ServeMode::Stdio => {
+                    reject_listener_flags_on_stdio(serve_matches)?;
+                    run_supervisor_stdio(args, filter, worker_args)
+                }
+            }
         }
         Command::Worker(_args) => {
             run_server_with_mode(build_filter()?, ServerMode::Worker, allow_lumina)
@@ -613,11 +718,13 @@ fn cancel_background_tasks(registry: &TaskRegistry, message: &str) {
 }
 
 fn run_supervisor_stdio(
-    max_workers: usize,
-    unsafe_tools: bool,
+    args: ServeArgs,
     filter: Arc<ToolPolicy>,
     worker_args: Vec<OsString>,
 ) -> anyhow::Result<()> {
+    args.validate_pool()?;
+    let max_workers = args.max_workers.get();
+    let unsafe_tools = args.unsafe_tools;
     info!(
         max_workers,
         unsafe_tools, "Starting explicit multi-database supervisor on stdio"
@@ -630,11 +737,14 @@ fn run_supervisor_stdio(
     runtime.block_on(async move {
         let exe_path = std::env::current_exe()
             .map_err(|error| anyhow::anyhow!("failed to resolve current executable: {error}"))?;
+        // The same pool as the HTTP path, configured the same way. These three
+        // used to be hardcoded here, which made half the pool flags mean
+        // nothing on stdio for no reason anyone had written down.
         let pool = WorkerPool::new(WorkerPoolConfig {
             max_workers,
-            min_workers: 0,
-            worker_idle_timeout: Duration::from_secs(300),
-            worker_op_timeout: Duration::from_secs(1800),
+            min_workers: args.min_workers,
+            worker_idle_timeout: Duration::from_secs(args.worker_idle_timeout_secs),
+            worker_op_timeout: Duration::from_secs(args.worker_op_timeout_secs.get()),
             exe_path,
             worker_args,
         });
@@ -820,27 +930,13 @@ fn exposure(unsafe_tools: bool) -> vibrev_kit::transport::Exposure {
 }
 
 fn run_supervisor_http(
-    args: ServeHttpArgs,
+    args: ServeArgs,
     http: vibrev_kit::transport::HttpOptions,
-    unsafe_tools: bool,
     filter: Arc<ToolPolicy>,
     worker_args: Vec<OsString>,
 ) -> anyhow::Result<()> {
-    if args.max_workers == 0 {
-        return Err(anyhow::anyhow!("--max-workers must be at least 1"));
-    }
-    if args.min_workers > args.max_workers {
-        return Err(anyhow::anyhow!(
-            "--min-workers ({}) cannot exceed --max-workers ({})",
-            args.min_workers,
-            args.max_workers
-        ));
-    }
-    if args.worker_op_timeout_secs == 0 {
-        return Err(anyhow::anyhow!(
-            "--worker-op-timeout-secs must be at least 1"
-        ));
-    }
+    args.validate_pool()?;
+    let unsafe_tools = args.unsafe_tools;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -864,10 +960,10 @@ fn run_supervisor_http(
         let exe_path = std::env::current_exe()
             .map_err(|error| anyhow::anyhow!("failed to resolve current executable: {error}"))?;
         let pool = WorkerPool::new(WorkerPoolConfig {
-            max_workers: args.max_workers,
+            max_workers: args.max_workers.get(),
             min_workers: args.min_workers,
             worker_idle_timeout: Duration::from_secs(args.worker_idle_timeout_secs),
-            worker_op_timeout: Duration::from_secs(args.worker_op_timeout_secs),
+            worker_op_timeout: Duration::from_secs(args.worker_op_timeout_secs.get()),
             exe_path,
             worker_args,
         });
@@ -1203,6 +1299,18 @@ mod tests {
     use std::ffi::OsString;
     use vibrev_kit::policy::PolicyArgs;
 
+    fn serve_args(argv: &[&str]) -> crate::ServeArgs {
+        let matches = cli_command().get_matches_from(argv);
+        let crate::Command::Serve(args) = <Cli as clap::FromArgMatches>::from_arg_matches(&matches)
+            .expect("root parses")
+            .command
+            .expect("subcommand")
+        else {
+            panic!("expected serve")
+        };
+        args
+    }
+
     /// The listener flags are the kit's and hang on this subcommand, so this
     /// goes through the real command tree: `Cli::parse_from` never sees them,
     /// and a wiring mistake in `cli_command` is exactly what would make
@@ -1211,15 +1319,15 @@ mod tests {
     fn the_listener_flags_reach_the_subcommand_that_uses_them() {
         let matches = cli_command().get_matches_from([
             "ida-mcp",
-            "serve-http",
+            "serve",
             "--bind",
             "127.0.0.1:19999",
             "--allow-host",
             "ida-box.local",
         ]);
         let leaf = matches
-            .subcommand_matches(crate::SERVE_HTTP_COMMAND)
-            .expect("serve-http matches");
+            .subcommand_matches(crate::SERVE_COMMAND)
+            .expect("serve matches");
         let http = vibrev_kit::transport::HttpOptions::read(leaf);
         assert_eq!(http.bind.to_string(), "127.0.0.1:19999");
         assert_eq!(http.allow_host, Some(vec!["ida-box.local".to_string()]));
@@ -1227,13 +1335,12 @@ mod tests {
         // this engine has always used.
         assert_eq!(http.session_keep_alive_secs, 1800);
 
-        let crate::Command::ServeHttp(args) =
-            <Cli as clap::FromArgMatches>::from_arg_matches(&matches)
-                .expect("root parses")
-                .command
-                .expect("subcommand")
+        let crate::Command::Serve(args) = <Cli as clap::FromArgMatches>::from_arg_matches(&matches)
+            .expect("root parses")
+            .command
+            .expect("subcommand")
         else {
-            panic!("expected serve-http")
+            panic!("expected serve")
         };
         assert_eq!(args.worker_disconnect_grace_secs, 2);
     }
@@ -1243,17 +1350,142 @@ mod tests {
     /// this one covers the grafting, which is where such a flag would have to
     /// be reintroduced to take effect.
     #[test]
-    fn serve_http_offers_no_way_to_drop_the_credential() {
+    fn serve_offers_no_way_to_drop_the_credential() {
         let mut command = cli_command();
         let rendered = command
-            .find_subcommand_mut(crate::SERVE_HTTP_COMMAND)
-            .expect("serve-http")
+            .find_subcommand_mut(crate::SERVE_COMMAND)
+            .expect("serve")
             .render_long_help()
             .to_string();
         for absent in ["--no-auth", "--insecure", "--anonymous", "--no-token"] {
             assert!(!rendered.contains(absent), "{absent} is offered");
         }
         assert!(rendered.contains("--token-file"));
+    }
+
+    /// The bare invocation does not go through clap's subcommand parsing, so
+    /// its defaults come from `ServeArgs::default`. If that ever stops agreeing
+    /// with the clap-declared ones, `ida-headless-mcp` and
+    /// `ida-headless-mcp serve` become two different servers that look alike.
+    #[test]
+    fn a_bare_invocation_serves_what_an_explicit_serve_would() {
+        let explicit = serve_args(&["ida-mcp", "serve"]);
+        let bare = crate::ServeArgs::default();
+
+        assert_eq!(bare.mode, explicit.mode);
+        assert_eq!(bare.max_workers, explicit.max_workers);
+        assert_eq!(bare.min_workers, explicit.min_workers);
+        assert_eq!(
+            bare.worker_idle_timeout_secs,
+            explicit.worker_idle_timeout_secs
+        );
+        assert_eq!(bare.worker_op_timeout_secs, explicit.worker_op_timeout_secs);
+        assert_eq!(
+            bare.worker_disconnect_grace_secs,
+            explicit.worker_disconnect_grace_secs
+        );
+    }
+
+    #[test]
+    fn http_is_the_default_transport() {
+        assert_eq!(
+            serve_args(&["ida-mcp", "serve"]).mode,
+            crate::ServeMode::Http
+        );
+        assert_eq!(
+            serve_args(&["ida-mcp", "serve", "--mode", "stdio"]).mode,
+            crate::ServeMode::Stdio
+        );
+    }
+
+    /// The pool cap has exactly one spelling, and it is the one the env var
+    /// already used. `serve-http` called it `--max-workers` while a global
+    /// `--max-databases` meant the same thing, was ignored, and carried
+    /// `IDA_MCP_MAX_WORKERS` — so the flag and its own variable disagreed. The
+    /// merge kept `--max-workers`, and left no alias for the name that lost.
+    #[test]
+    fn the_pool_cap_has_one_spelling() {
+        assert_eq!(
+            serve_args(&["ida-mcp", "serve", "--max-workers", "7"])
+                .max_workers
+                .get(),
+            7
+        );
+        assert!(cli_command()
+            .try_get_matches_from(["ida-mcp", "serve", "--max-databases", "7"])
+            .is_err());
+    }
+
+    /// A listener flag under `--mode stdio` is refused rather than ignored.
+    /// Silently accepting it is the exact defect this command merge removed:
+    /// `--max-databases` parsed fine under `serve-http` and did nothing.
+    #[test]
+    fn a_listener_flag_is_refused_on_stdio() {
+        let matches = cli_command().get_matches_from([
+            "ida-mcp",
+            "serve",
+            "--mode",
+            "stdio",
+            "--bind",
+            "0.0.0.0:9000",
+        ]);
+        let error =
+            crate::reject_listener_flags_on_stdio(matches.subcommand_matches(crate::SERVE_COMMAND))
+                .expect_err("--bind must be refused under --mode stdio");
+        let message = error.to_string();
+        assert!(message.contains("--bind"), "{message}");
+        assert!(message.contains("--mode stdio"), "{message}");
+
+        // Ours, not the kit's, and just as meaningless without a stream.
+        let matches = cli_command().get_matches_from([
+            "ida-mcp",
+            "serve",
+            "--mode",
+            "stdio",
+            "--worker-disconnect-grace-secs",
+            "9",
+        ]);
+        assert!(crate::reject_listener_flags_on_stdio(
+            matches.subcommand_matches(crate::SERVE_COMMAND)
+        )
+        .is_err());
+    }
+
+    /// Pool flags are not listener flags: they configure the child processes
+    /// both transports share, so stdio must accept them.
+    #[test]
+    fn pool_flags_are_accepted_on_stdio() {
+        let matches = cli_command().get_matches_from([
+            "ida-mcp",
+            "serve",
+            "--mode",
+            "stdio",
+            "--max-workers",
+            "2",
+            "--min-workers",
+            "1",
+            "--worker-idle-timeout-secs",
+            "60",
+        ]);
+        crate::reject_listener_flags_on_stdio(matches.subcommand_matches(crate::SERVE_COMMAND))
+            .expect("pool flags are not listener flags");
+    }
+
+    #[test]
+    fn min_workers_cannot_exceed_max_workers() {
+        assert!(serve_args(&["ida-mcp", "serve", "--max-workers", "2"])
+            .validate_pool()
+            .is_ok());
+        assert!(serve_args(&[
+            "ida-mcp",
+            "serve",
+            "--max-workers",
+            "2",
+            "--min-workers",
+            "3"
+        ])
+        .validate_pool()
+        .is_err());
     }
 
     #[test]

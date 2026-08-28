@@ -55,6 +55,17 @@ pub mod server;
 pub mod skills;
 pub mod supervisor;
 
+/// The root-level commands the binary handles itself.
+///
+/// Lives here rather than in `main.rs` because two crates need the same answer:
+/// the binary feeds it to `assert_management_matches_command`, and the library's
+/// own tests check that no published tool name collides with one of these. When
+/// it was a constant in `main.rs` plus copies in the tests, the copies drifted —
+/// they still named `serve-http` after that command was merged into
+/// `serve --mode`, and never gained `skills`, and nothing failed, because a copy
+/// only feeds a collision check that a stale name cannot trip.
+pub const MANAGEMENT_COMMANDS: &[&str] = &["serve", "worker", "probe", "skills"];
+
 pub use error::ToolError;
 pub use ida::{
     init_ida_library, run_ida_loop, AddressInfo, ApplyTypesSpec, BasicBlockInfo, BytesResult,

@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # Sequential supervisor stdio session test.
 #
-# The default entry point is the supervisor. Feed it one JSON-RPC request at a
-# time over a FIFO and wait for that id before sending the next, so tools/call
-# cannot race ahead of idb_open. Opens the checked-in/bootstrapped
+# Runs the supervisor over stdio -- the transport an installed MCP client
+# spawns, and the one `--mode stdio` selects now that HTTP is the default.
+# Feed it one JSON-RPC request at a time over a FIFO and wait for that id
+# before sending the next, so tools/call cannot race ahead of idb_open.
+# Opens the checked-in/bootstrapped
 # fixtures/mini.i64 (already analysed) rather than a freshly compiled raw
 # binary, and uses function names plus resolve_function instead of hardcoded
 # Mach-O addresses.
@@ -252,14 +254,14 @@ assert_expected() {
 }
 
 # ---------------------------------------------------------------------------
-# Start supervisor (default entry — not `worker`)
+# Start supervisor over stdio (not `worker`, and not the HTTP default)
 # ---------------------------------------------------------------------------
 mkfifo "$fifo_in"
 : >"$log"
 : >"$errlog"
 # Keep JSON-RPC stdout separate from tracing stderr so a flushed log line
 # cannot tear a response and wedge wait_response.
-RUST_LOG="${RUST_LOG:-ida_mcp=trace}" "$BIN" <"$fifo_in" >"$log" 2>"$errlog" &
+RUST_LOG="${RUST_LOG:-ida_mcp=trace}" "$BIN" serve --mode stdio <"$fifo_in" >"$log" 2>"$errlog" &
 server_pid=$!
 exec 3>"$fifo_in"
 

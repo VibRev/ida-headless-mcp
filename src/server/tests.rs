@@ -1800,10 +1800,16 @@ async fn an_unmigrated_tool_is_not_reachable_from_the_derived_cli() {
 
 /// The name-collision check against the real manifest: it runs over this
 /// engine's actual management commands, and the tool tree builds.
+///
+/// The list comes from `crate::MANAGEMENT_COMMANDS` rather than a copy. A copy
+/// is what this was, and it had drifted: it still named `serve-http` after that
+/// command was merged into `serve --mode`, and had never gained `skills`.
+/// Nothing failed, because `with_management` only feeds the collision check —
+/// so the copy could name commands that do not exist indefinitely.
 #[test]
 fn the_derived_tree_builds_against_the_real_management_commands() {
     let cmd = IdaMcpServer::vibrev_cli("ida-headless-mcp")
-        .with_management(&["serve", "serve-http", "worker", "probe"])
+        .with_management(crate::MANAGEMENT_COMMANDS)
         .with_session(&super::SESSION)
         .command();
     let mut names: Vec<&str> = cmd
@@ -1842,7 +1848,12 @@ fn a_management_command_may_not_take_a_real_tool_name() {
 /// assume it.
 #[test]
 fn no_published_tool_name_collides_with_a_management_command() {
-    let management = ["serve", "serve-http", "worker", "probe", "help", "tool"];
+    // This engine's own commands, plus the two clap and the kit add.
+    let management: Vec<&str> = crate::MANAGEMENT_COMMANDS
+        .iter()
+        .copied()
+        .chain(["help", vibrev_kit::cli::TOOL_COMMAND])
+        .collect();
     let colliding: Vec<String> = IdaMcpServer::tool_router()
         .list_all()
         .into_iter()

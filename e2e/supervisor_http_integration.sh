@@ -22,7 +22,7 @@ server_log="$tmpdir/server.log"
 second_binary="$tmpdir/mini-second"
 legacy_sse_log="$tmpdir/legacy-sse.log"
 
-# The bearer token is unconditional on serve-http. Seed a throwaway
+# The bearer token is unconditional on serve --mode http. Seed a throwaway
 # token file rather than letting the server touch the real ~/.vibrev/token —
 # a test must not create or read the operator's long-lived credential.
 token_file="$tmpdir/token"
@@ -49,7 +49,7 @@ trap cleanup EXIT INT TERM
 # mostly rejects reverse proxies and container DNS names. Naming a host here
 # turns it back on, which is what the assertions below actually exercise.
 server_args=(
-  serve-http
+  serve --mode http
   --bind "127.0.0.1:${PORT}"
   --allow-origin "http://localhost"
   --allow-host "localhost"
