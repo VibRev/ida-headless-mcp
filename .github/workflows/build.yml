@@ -154,7 +154,12 @@ jobs:
           # Strip the tag's leading v so the archive carries the same product
           # version every publishing recipe computes from Cargo.toml. Branch
           # builds keep the branch name; they are CI artifacts, not releases.
-          package="ida-headless-mcp_${GITHUB_REF_NAME#v}_ida-${{ matrix.sdk.minor }}_${{ matrix.platform.os }}_${{ matrix.platform.arch }}"
+          # PR refs (`4/merge`) and ordinary branch names may contain slashes,
+          # which must not turn the archive name into a nested path.
+          version="${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}"
+          version="${version#v}"
+          version="${version//\//-}"
+          package="ida-headless-mcp_${version}_ida-${{ matrix.sdk.minor }}_${{ matrix.platform.os }}_${{ matrix.platform.arch }}"
           mkdir -p "${package}"
           cp "${{ matrix.sdk.target_dir }}/release/${{ matrix.platform.executable }}" "${package}/"
           cp README.md LICENSE NOTICE "${package}/"
@@ -164,8 +169,9 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          # Same leading-v strip as the Unix step above.
-          $version = $env:GITHUB_REF_NAME -replace '^v', ''
+          # Same ref selection and filename sanitization as the Unix step above.
+          $refName = if ($env:GITHUB_HEAD_REF) { $env:GITHUB_HEAD_REF } else { $env:GITHUB_REF_NAME }
+          $version = ($refName -replace '^v', '') -replace '[/\\]', '-'
           $package = "ida-headless-mcp_${version}_ida-${{ matrix.sdk.minor }}_${{ matrix.platform.os }}_${{ matrix.platform.arch }}"
           New-Item -ItemType Directory -Path $package
           Copy-Item "${{ matrix.sdk.target_dir }}/release/${{ matrix.platform.executable }}" "$package/"
