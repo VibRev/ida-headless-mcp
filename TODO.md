@@ -61,6 +61,18 @@ Origin 关不掉：kit 的 `validate_origin` 只有两条路——header 不存�
 
 ---
 
+### 4. CI 编译测试但跑不了它们
+
+`verify` job 跑的是 `cargo test --locked --no-run`。原因不是偷懒：单元测试不开数据库，但它们所在的二进制链了 `libida`/`libidalib`，loader 在任何测试开始前就要解析这两个库。runner 上没有 IDA，链接时用的是 idalib SDK submodule 自带的 stub——那些 stub 只为满足链接器而存在，**把 loader 指向它们，测试进程在第一条测试之前就 SIGSEGV**（实测过）。`--no-default-features` 也不是出路，`build.rs` 要求必须选中一个 SDK feature。
+
+所以 CI 回答的是「每个 target 在这个平台上编不编得过」——三个 runner 存在的意义正是这个问题——而那 301 条断言在有 IDA 的地方跑（`just check`，推送前）。
+
+**这是一处真实的门禁削弱**：CI 抓不到测试回归。要补上得让 crate 支持一种不链 idalib 的构建模式（把 IDA 那层 cfg 掉），纯逻辑测试就能在任何机器上跑。那是一件独立的活。
+
+> 参照：2026-08-17 那次 CI 是绿的，`cargo test --locked` 跑出 230 条通过——**当时默认 SDK 是 9.2**。换成 9.4 之后测试二进制才开始在加载期硬依赖 `libida.so`。
+
+---
+
 ## P1 —— 已知缺口
 
 | 项 | 状态 |

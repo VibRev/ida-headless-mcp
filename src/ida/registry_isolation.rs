@@ -191,11 +191,14 @@ fn reap_stale_snapshots(root: &RegistryKey) {
         }
 
         let name = String::from_utf16_lossy(&name[..name_len as usize]);
-        if snapshot_should_be_reaped(&name, process_is_running) {
-            if delete_registry_tree(root.0, &name) {
-                info!(snapshot = %name, "Removed stale IDA registry snapshot");
-                continue;
-            }
+        // `continue` only on a successful delete: the enumeration index must not
+        // advance past an entry that is still there, or the next iteration skips
+        // whatever slid into its place.
+        if snapshot_should_be_reaped(&name, process_is_running)
+            && delete_registry_tree(root.0, &name)
+        {
+            info!(snapshot = %name, "Removed stale IDA registry snapshot");
+            continue;
         }
         index += 1;
     }
