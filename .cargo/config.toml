@@ -1,0 +1,29 @@
+# Linker settings for the 9.2 and 9.3 dependency tables.
+#
+# Their `idalib-sys` defines its C++ wrappers as non-`inline` free functions in
+# `src/*_extras.h`. `cxxgen1.h` includes all 21 of those headers and five
+# translation units include `cxxgen1.h`, so each object file emits its own
+# strong definition — 244 symbols, five copies each. That is an ODR violation,
+# and the linker is right to refuse it. Upstream marked all of them `inline`
+# for 9.4, which is why the default build needs no help here.
+#
+# This file cannot be scoped to those two manifests: Cargo discovers config by
+# walking up from the working directory, not from `--manifest-path`, and both
+# `sdk/ida-9X` builds are invoked from the repo root. So the flag is on for 9.4
+# too, where it is not needed — and would mask the violation coming back.
+# Nothing currently checks that. See TODO.md.
+#
+# macOS is absent on purpose: `ld64` does not reject these, so 9.2 and 9.3 link
+# there without a flag.
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/FORCE:MULTIPLE"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/FORCE:MULTIPLE"]
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]
+
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]

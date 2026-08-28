@@ -1,0 +1,172 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, macos-15, windows-2025]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install LLVM
+        if: runner.os == 'Windows'
+        uses: KyleMayes/install-llvm-action@ebc0426251bc40c7cd31162802432c68818ab8f0 # v2
+        with:
+          version: "20"
+          directory: "${{ runner.temp }}/llvm-20"
+
+      - name: Configure LLVM
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: echo "LIBCLANG_PATH=$((Get-Command clang).Source -replace 'clang.exe')" >> $env:GITHUB_ENV
+
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          components: clippy, rustfmt
+
+      # Formatting and the alternate dependency tables are platform-independent,
+      # so one runner answers for all three.
+      - name: Check formatting
+        if: runner.os == 'Linux'
+        run: cargo fmt --all --check
+
+      # The three manifests share one source tree but cannot share a Cargo.lock:
+      # each idalib revision declares `links = "idalib"`, so only one can be in
+      # the graph. Drift between them is invisible until someone builds the
+      # other two — which is how they stayed broken from U5 to U8.
+      - name: Lint the 9.2 dependency table
+        if: runner.os == 'Linux'
+        run: cargo clippy --manifest-path sdk/ida-92/Cargo.toml --all-targets -- -D warnings
+
+      - name: Lint the 9.3 dependency table
+        if: runner.os == 'Linux'
+        run: cargo clippy --manifest-path sdk/ida-93/Cargo.toml --all-targets -- -D warnings
+
+      # These two run everywhere: the crate carries `cfg(windows)` paths, process
+      # handling, and file locking that Linux cannot answer for.
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --locked
+
+  build:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - runner: ubuntu-24.04
+            os: Linux
+            arch: x86_64
+            executable: ida-headless-mcp
+          - runner: macos-15
+            os: macOS
+            arch: arm64
+            executable: ida-headless-mcp
+          - runner: windows-2025
+            os: Windows
+            arch: x86_64
+            executable: ida-headless-mcp.exe
+        sdk:
+          - minor: "9.4"
+            manifest: Cargo.toml
+            target_dir: target
+            cargo_args: ""
+          - minor: "9.3"
+            manifest: sdk/ida-93/Cargo.toml
+            target_dir: sdk/ida-93/target
+            cargo_args: ""
+          - minor: "9.2"
+            manifest: sdk/ida-92/Cargo.toml
+            target_dir: sdk/ida-92/target
+            cargo_args: ""
+    runs-on: ${{ matrix.platform.runner }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install LLVM
+        if: runner.os == 'Windows'
+        uses: KyleMayes/install-llvm-action@ebc0426251bc40c7cd31162802432c68818ab8f0 # v2
+        with:
+          version: "20"
+          directory: "${{ runner.temp }}/llvm-20"
+
+      - name: Configure LLVM
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: echo "LIBCLANG_PATH=$((Get-Command clang).Source -replace 'clang.exe')" >> $env:GITHUB_ENV
+
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+
+      - name: Build SDK-specific binary
+        run: >-
+          cargo build --release --locked
+          --manifest-path "${{ matrix.sdk.manifest }}"
+          ${{ matrix.sdk.cargo_args }}
+
+      - name: Package Unix artifact
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          # Strip the tag's leading v so the archive carries the same product
+          # version every publishing recipe computes from Cargo.toml. Branch
+          # builds keep the branch name; they are CI artifacts, not releases.
+          package="ida-headless-mcp_${GITHUB_REF_NAME#v}_ida-${{ matrix.sdk.minor }}_${{ matrix.platform.os }}_${{ matrix.platform.arch }}"
+          mkdir -p "${package}"
+          cp "${{ matrix.sdk.target_dir }}/release/${{ matrix.platform.executable }}" "${package}/"
+          cp README.md LICENSE NOTICE "${package}/"
+          tar -czf "${package}.tar.gz" "${package}"
+
+      - name: Package Windows artifact
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # Same leading-v strip as the Unix step above.
+          $version = $env:GITHUB_REF_NAME -replace '^v', ''
+          $package = "ida-headless-mcp_${version}_ida-${{ matrix.sdk.minor }}_${{ matrix.platform.os }}_${{ matrix.platform.arch }}"
+          New-Item -ItemType Directory -Path $package
+          Copy-Item "${{ matrix.sdk.target_dir }}/release/${{ matrix.platform.executable }}" "$package/"
+          Copy-Item README.md, LICENSE, NOTICE "$package/"
+          Compress-Archive -Path "$package/*" -DestinationPath "$package.zip"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ida-${{ matrix.sdk.minor }}-${{ matrix.platform.os }}-${{ matrix.platform.arch }}
+          path: |
+            ida-headless-mcp_*.tar.gz
+            ida-headless-mcp_*.zip
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Generate checksums
+        working-directory: artifacts
+        run: sha256sum ida-headless-mcp_* > checksums.txt
+      - uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2
+        with:
+          files: |
+            artifacts/ida-headless-mcp_*.tar.gz
+            artifacts/ida-headless-mcp_*.zip
+            artifacts/checksums.txt
+          generate_release_notes: true

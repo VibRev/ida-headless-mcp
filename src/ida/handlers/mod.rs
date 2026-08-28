@@ -1,0 +1,129 @@
+//! IDA operation handlers organized by domain.
+
+pub mod address;
+pub mod analysis;
+pub mod annotations;
+pub mod controlflow;
+pub mod database;
+pub mod definitions;
+pub mod disasm;
+pub mod dscu;
+pub mod functions;
+pub mod globals;
+pub mod imports;
+pub mod lumina;
+pub mod memory;
+pub mod script;
+pub mod search;
+pub mod segments;
+pub mod signature;
+pub mod strings;
+pub mod structs;
+pub mod types;
+pub mod warmup;
+pub mod xrefs;
+
+use crate::error::ToolError;
+use idalib::IDB;
+
+// ============================================================================
+// Shared utility functions used across multiple handlers
+// ============================================================================
+
+pub(crate) fn parse_address_str(s: &str) -> Result<u64, ToolError> {
+    crate::address::parse_address(s)
+}
+
+pub(crate) fn try_parse_address(s: &str) -> Option<u64> {
+    parse_address_str(s).ok()
+}
+
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+/// Resolve an address by name (function or symbol).
+pub(crate) fn resolve_address_by_name(idb: &Option<IDB>, name: &str) -> Result<u64, ToolError> {
+    let db = idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
+    for (_id, func) in db.functions() {
+        if let Some(func_name) = func.name()
+            && (func_name == name || func_name.contains(name))
+        {
+            return Ok(func.start_address());
+        }
+    }
+    for item in db.names().iter() {
+        let item_name = item.name();
+        if item_name == name || item_name.contains(name) {
+            return Ok(item.address());
+        }
+    }
+    Err(ToolError::FunctionNameNotFound(name.to_string()))
+}
+
+/// Resolve an address from either explicit address, name, or name+offset.
+/// `offset` is a signed delta so callers can express `symbol - 0x10` directly;
+/// out-of-range arithmetic surfaces as `InvalidParams` rather than wrapping.
+pub(crate) fn resolve_address(
+    idb: &Option<IDB>,
+    addr: Option<u64>,
+    name: Option<&str>,
+    offset: i64,
+) -> Result<u64, ToolError> {
+    let base = if let Some(addr) = addr {
+        addr
+    } else if let Some(name) = name {
+        resolve_address_by_name(idb, name)?
+    } else {
+        return Err(ToolError::InvalidParams(
+            "expected address or name".to_string(),
+        ));
+    };
+    base.checked_add_signed(offset).ok_or_else(|| {
+        ToolError::InvalidParams(format!(
+            "offset {offset} produces an out-of-range address from base {base:#x}"
+        ))
+    })
+}
+
+/// Parse a byte pattern string supporting wildcards.
+pub(crate) fn parse_pattern(pattern: &str) -> Result<Vec<Option<u8>>, ToolError> {
+    let trimmed = pattern.trim();
+    if trimmed.is_empty() {
+        return Err(ToolError::IdaError("empty pattern".to_string()));
+    }
+
+    let tokens: Vec<String> = if trimmed.contains(' ') {
+        trimmed.split_whitespace().map(|s| s.to_string()).collect()
+    } else {
+        if !trimmed.len().is_multiple_of(2) {
+            return Err(ToolError::IdaError(format!(
+                "invalid hex pattern length: {}",
+                trimmed
+            )));
+        }
+        trimmed
+            .as_bytes()
+            .chunks(2)
+            .map(|c| String::from_utf8_lossy(c).to_string())
+            .collect()
+    };
+
+    let mut bytes = Vec::with_capacity(tokens.len());
+    for tok in tokens {
+        if tok == "?" || tok == "??" {
+            bytes.push(None);
+            continue;
+        }
+        let b = u8::from_str_radix(tok.trim_start_matches("0x"), 16)
+            .map_err(|_| ToolError::IdaError(format!("invalid byte: {}", tok)))?;
+        bytes.push(Some(b));
+    }
+
+    Ok(bytes)
+}

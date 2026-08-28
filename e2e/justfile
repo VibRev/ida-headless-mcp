@@ -1,0 +1,905 @@
+# Test justfile for ida-mcp
+
+cc := env_var_or_default("CC", "cc")
+cflags := env_var_or_default("CFLAGS", "-O0 -g -fno-omit-frame-pointer")
+test_src := "fixtures/mini.c"
+test_bin := "fixtures/mini"
+test_i64 := "fixtures/mini.i64"
+test_lock := "fixtures/mini.imcp"
+server_bin := env_var_or_default("SERVER_BIN", "../target/release/ida-headless-mcp")
+rust_log := env_var_or_default("RUST_LOG", "ida_mcp=trace")
+
+# Show available recipes
+default:
+    @just --list
+
+# Run the multi-session supervisor against two independent IDBs.
+test-supervisor-http: fixture
+    MCP_HTTP_BIN="{{ server_bin }}" IDB_PATH="{{ test_bin }}" bash ./supervisor_http_integration.sh
+
+# Verify the advertised catalog and resources without opening a database (no IDA license needed).
+test-supervisor-catalog: build-check
+    SUPERVISOR_SKIP_IDA=1 MCP_HTTP_BIN="{{ server_bin }}" bash ./supervisor_http_integration.sh
+
+# Run the supervisor test while killing and replacing one IDA worker.
+test-supervisor-http-recovery: fixture
+    SUPERVISOR_UNSAFE=1 SUPERVISOR_TEST_TOOL_SMOKE=1 SUPERVISOR_TEST_WORKER_RECOVERY=1 MCP_HTTP_BIN="{{ server_bin }}" IDB_PATH="{{ test_bin }}" bash ./supervisor_http_integration.sh
+
+# Fail early with a clear message when the server binary has not been built.
+build-check:
+    @[ -x "{{ server_bin }}" ] || { echo "Server binary not found: {{ server_bin }}"; exit 1; }
+
+# Build test fixture
+fixture:
+    @[ "{{ test_bin }}" -nt "{{ test_src }}" ] || {{ cc }} {{ cflags }} -o "{{ test_bin }}" "{{ test_src }}"
+
+# Bootstrap a deterministic .i64 fixture for tests that should not wait on raw-binary auto-analysis
+test-bootstrap: fixture
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -x "{{ server_bin }}" ]; then
+        echo "Server binary not found: {{ server_bin }}"
+        echo "Run 'cargo build --release' first"
+        exit 1
+    fi
+    LOCK="{{ test_lock }}"
+    if [ -f "$LOCK" ]; then
+        pid=$(awk -F= '$1=="pid"{print $2}' "$LOCK" | tr -d '\r')
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            echo "Lock file $LOCK is held by pid $pid; close that server first." >&2
+            exit 1
+        fi
+        echo "🧹 Removing stale lock $LOCK (pid $pid dead)"
+        rm -f "$LOCK"
+    fi
+    rm -f "{{ test_bin }}".id0 "{{ test_bin }}".id1 "{{ test_bin }}".id2 "{{ test_bin }}".nam "{{ test_bin }}".til
+    if [ -f "{{ test_i64 }}" ] && [ "{{ test_i64 }}" -nt "{{ test_bin }}" ]; then
+        echo "✅ Bootstrap fixture already present: {{ test_i64 }}"
+        exit 0
+    fi
+    rm -f "{{ test_i64 }}"
+    echo "🧪 Bootstrapping {{ test_i64 }} via MCP server..."
+    RUST_LOG="{{ rust_log }}" MCP_HTTP_BIN="{{ server_bin }}" IDB_PATH="{{ test_bin }}" bash ./http_bootstrap.sh
+    echo "✅ Bootstrap fixture created: {{ test_i64 }}"
+
+# Sequential supervisor stdio session test against fixtures/mini.i64.
+# Compiles mini.c for other recipes, but the session client opens the
+# already-analysed IDB (not the raw binary) and waits for each JSON-RPC id.
+test: fixture
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -x "{{ server_bin }}" ]; then
+        echo "Server binary not found: {{ server_bin }}"
+        echo "Run 'cargo build --release' first"
+        exit 1
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "jq is required for the stdio session test"
+        exit 1
+    fi
+    if [ ! -f "{{ test_i64 }}" ] || [ "{{ test_src }}" -nt "{{ test_i64 }}" ]; then
+        echo "fixtures/mini.i64 missing or older than mini.c; bootstrapping..."
+        just test-bootstrap
+    fi
+    LOCK="{{ test_lock }}"
+    if [ -f "$LOCK" ]; then
+        pid=$(awk -F= '$1=="pid"{print $2}' "$LOCK" | tr -d '\r')
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            echo "Lock file $LOCK is held by pid $pid; close that server first." >&2
+            exit 1
+        else
+            echo "🧹 Removing stale lock $LOCK (pid $pid dead)"
+            rm -f "$LOCK"
+        fi
+    fi
+    echo "🧪 Running sequential supervisor stdio session test..."
+    RUST_LOG="{{ rust_log }}" SERVER_BIN="{{ server_bin }}" \
+        IDB_PATH="$(pwd)/{{ test_i64 }}" \
+        bash ./stdio_session.sh
+
+# Verify that a licensed Hex-Rays installation can decompile a known function.
+# This catches stale inline SDK compatibility values such as HEXRAYS_API_MAGIC.
+test-decompile: test-bootstrap
+    #!/usr/bin/env bash
+    set -euo pipefail
+    SERVER_BIN="{{ server_bin }}" bash ./stdio_decompile.sh
+
+# Verify that license validation succeeds during preflight or database open.
+test-license: fixture
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -x "{{ server_bin }}" ]; then
+        echo "Server binary not found: {{ server_bin }}"
+        exit 1
+    fi
+    # Native open_idb: the license check happens in the worker, and the worker
+    # subcommand serves the native surface without supervisor session routing.
+    echo "🧪 Running license preflight test..."
+    log="$(mktemp)"
+    output="$(mktemp)"
+    trap 'rm -f "$log" "$output"' EXIT
+    printf '%s\n' \
+      '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"lic","version":"0"},"capabilities":{}}}' \
+      '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}' \
+      '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"open_idb","arguments":{"path":"{{ test_bin }}"}}}' \
+      '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"close_idb","arguments":{}}}' \
+      | RUST_LOG="{{ rust_log }}" "{{ server_bin }}" worker >"$output" 2>"$log" || true
+    if grep -Eq 'IDA license expired|IDA license is invalid' "$log"; then
+        echo "❌ License preflight reports an unhealthy license:" >&2
+        grep -E 'IDA license' "$log" >&2
+        exit 1
+    fi
+    if grep -q 'Skipping IDA license expiry preflight' "$log"; then
+        if ! jq -e 'select(.id == 2) | .result.isError == false' "$output" >/dev/null; then
+            echo "❌ IDA 9.4 database open did not validate the license successfully:" >&2
+            jq -c 'select(.id == 2)' "$output" >&2 || true
+            exit 1
+        fi
+    elif ! grep -Eq 'IDA license valid|IDA license expires in' "$log"; then
+        echo "❌ License preflight did not run (no expiry log line). Init log tail:" >&2
+        grep -E 'Initializing|runtime version|license' "$log" >&2 || tail -20 "$log" >&2
+        exit 1
+    fi
+    grep -E 'IDA license' "$log"
+    echo "✅ License preflight test passed"
+
+# Run HTTP integration test
+test-http: fixture
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -x "{{ server_bin }}" ]; then
+        echo "Server binary not found: {{ server_bin }}"
+        echo "Run 'cargo build --release' first"
+        exit 1
+    fi
+    LOCK="{{ test_lock }}"
+    if [ -f "$LOCK" ]; then
+        pid=$(awk -F= '$1=="pid"{print $2}' "$LOCK" | tr -d '\r')
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            echo "Lock file $LOCK is held by pid $pid; close that server first." >&2
+            exit 1
+        else
+            rm -f "$LOCK"
+        fi
+    fi
+    echo "🧪 Running HTTP integration test..."
+    port_base=$((8765 + RANDOM % 1000))
+    i=0
+    for proto in 2024-11-05 2025-11-25; do
+        echo "── MCP protocol ${proto} ──"
+        RUST_LOG="{{ rust_log }}" IDB_PATH="{{ test_bin }}" \
+            MCP_HTTP_BIN="{{ server_bin }}" MCP_PROTOCOL_VERSION="${proto}" \
+            PORT=$((port_base + i)) \
+            ./http_integration.sh
+        i=$((i + 1))
+    done
+    issue_port=$((port_base + i))
+    issue_host="10.10.10.101:${issue_port}"
+    echo "── LAN Host header regression (#17) ──"
+    RUST_LOG="{{ rust_log }}" IDB_PATH="{{ test_bin }}" \
+        MCP_HTTP_BIN="{{ server_bin }}" MCP_PROTOCOL_VERSION="2025-11-25" \
+        MCP_HTTP_BIND_HOST="0.0.0.0" MCP_HTTP_CONNECT_HOST="127.0.0.1" \
+        MCP_HTTP_HOST_HEADER="${issue_host}" \
+        MCP_HTTP_ORIGIN="http://${issue_host}" \
+        MCP_HTTP_ALLOW_ORIGIN="http://${issue_host}" \
+        MCP_HTTP_ALLOW_HOST="10.10.10.100" \
+        PORT="${issue_port}" \
+        ./http_integration.sh
+    echo "✅ HTTP test passed"
+
+# Run HTTP close-ownership recovery test (issue #19, PRs #18 / #21)
+test-http-recovery: fixture
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -x "{{ server_bin }}" ]; then
+        echo "Server binary not found: {{ server_bin }}"
+        echo "Run 'cargo build --release' first"
+        exit 1
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "jq is required for close-recovery test (brew install jq)"
+        exit 1
+    fi
+    LOCK="{{ test_lock }}"
+    if [ -f "$LOCK" ]; then
+        pid=$(awk -F= '$1=="pid"{print $2}' "$LOCK" | tr -d '\r')
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            echo "Lock file $LOCK is held by pid $pid; close that server first." >&2
+            exit 1
+        else
+            rm -f "$LOCK"
+        fi
+    fi
+    echo "🧪 Running HTTP close-ownership recovery test..."
+    PORT=$((9100 + RANDOM % 800)) \
+        RUST_LOG="{{ rust_log }}" IDB_PATH="{{ test_bin }}" \
+        MCP_HTTP_BIN="{{ server_bin }}" \
+        ./http_close_recovery.sh
+    echo "✅ HTTP close-recovery test passed"
+
+# Verify a server that cannot bind fails loudly instead of wedging or
+# exiting zero. Needs no IDA license, database, or fixture.
+test-http-startup:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -x "{{ server_bin }}" ]; then
+        echo "Server binary not found: {{ server_bin }}"
+        echo "Run 'just build' first"
+        exit 1
+    fi
+    echo "🧪 Running HTTP startup failure test..."
+    PORT=$((9990 + RANDOM % 60)) \
+        MCP_HTTP_BIN="{{ server_bin }}" \
+        bash ./http_startup_failure.sh
+    echo "✅ HTTP startup failure test passed"
+
+# Verify legacy session DELETE cancels that session's background tasks on
+# single-worker HTTP (cancel-on-disconnect end-to-end oracle).
+test-session-cancel: fixture
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -x "{{ server_bin }}" ]; then
+        echo "Server binary not found: {{ server_bin }}"
+        echo "Run 'cargo build --release' first"
+        exit 1
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "jq is required for session-cancel test (brew install jq)"
+        exit 1
+    fi
+    echo "🧪 Running HTTP session cancel test..."
+    PORT=$((9900 + RANDOM % 90)) \
+        RUST_LOG="{{ rust_log }}" \
+        MCP_HTTP_BIN="{{ server_bin }}" \
+        ./http_session_cancel.sh
+    echo "✅ HTTP session-cancel test passed"
+
+# Pool tests use raw fixture copies in tmpdirs instead of the shared mini.i64
+# so killed workers cannot poison later runs with stale packed fixture state.
+
+# Run HTTP worker-pool concurrency test
+test-pool: fixture
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -x "{{ server_bin }}" ]; then
+        echo "Server binary not found: {{ server_bin }}"
+        echo "Run 'just build' first"
+        exit 1
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "jq is required for pool test (brew install jq)"
+        exit 1
+    fi
+    echo "🧪 Running HTTP worker-pool concurrency test..."
+    PORT=$((9300 + RANDOM % 500)) \
+        POOL_TEST_CASE=concurrency \
+        RUST_LOG="{{ rust_log }}" IDB_PATH="{{ test_bin }}" \
+        MCP_HTTP_BIN="{{ server_bin }}" \
+        bash ./http_pool.sh
+    echo "✅ HTTP worker-pool concurrency test passed"
+
+# Run HTTP worker-pool crash-containment test
+test-pool-crash: fixture
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -x "{{ server_bin }}" ]; then
+        echo "Server binary not found: {{ server_bin }}"
+        echo "Run 'just build' first"
+        exit 1
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "jq is required for pool crash test (brew install jq)"
+        exit 1
+    fi
+    echo "🧪 Running HTTP worker-pool crash-containment test..."
+    PORT=$((9400 + RANDOM % 500)) \
+        POOL_TEST_CASE=crash \
+        RUST_LOG="{{ rust_log }}" IDB_PATH="{{ test_bin }}" \
+        MCP_HTTP_BIN="{{ server_bin }}" \
+        bash ./http_pool.sh
+    echo "✅ HTTP worker-pool crash-containment test passed"
+
+# Run HTTP worker-pool exhaustion test
+test-pool-exhaustion: fixture
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -x "{{ server_bin }}" ]; then
+        echo "Server binary not found: {{ server_bin }}"
+        echo "Run 'just build' first"
+        exit 1
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "jq is required for pool exhaustion test (brew install jq)"
+        exit 1
+    fi
+    echo "🧪 Running HTTP worker-pool exhaustion test..."
+    PORT=$((9500 + RANDOM % 500)) \
+        POOL_TEST_CASE=exhaustion \
+        RUST_LOG="{{ rust_log }}" IDB_PATH="{{ test_bin }}" \
+        MCP_HTTP_BIN="{{ server_bin }}" \
+        bash ./http_pool.sh
+    echo "✅ HTTP worker-pool exhaustion test passed"
+
+# Run HTTP worker-pool failed-second-open lease preservation test
+test-pool-second-open: fixture
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -x "{{ server_bin }}" ]; then
+        echo "Server binary not found: {{ server_bin }}"
+        echo "Run 'just build' first"
+        exit 1
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "jq is required for pool second-open test (brew install jq)"
+        exit 1
+    fi
+    echo "🧪 Running HTTP worker-pool second-open failure test..."
+    PORT=$((9550 + RANDOM % 500)) \
+        POOL_TEST_CASE=second-open-failure \
+        RUST_LOG="{{ rust_log }}" IDB_PATH="{{ test_bin }}" \
+        MCP_HTTP_BIN="{{ server_bin }}" \
+        bash ./http_pool.sh
+    echo "✅ HTTP worker-pool second-open failure test passed"
+
+# Run HTTP worker-pool abandoned-client cleanup test
+test-pool-disconnect: fixture
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -x "{{ server_bin }}" ]; then
+        echo "Server binary not found: {{ server_bin }}"
+        echo "Run 'just build' first"
+        exit 1
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "jq is required for pool disconnect test (brew install jq)"
+        exit 1
+    fi
+    echo "🧪 Running HTTP worker-pool abandoned-client cleanup test..."
+    PORT=$((9600 + RANDOM % 500)) \
+        POOL_TEST_CASE=disconnect \
+        RUST_LOG="{{ rust_log }}" IDB_PATH="{{ test_bin }}" \
+        MCP_HTTP_BIN="{{ server_bin }}" \
+        bash ./http_pool.sh
+    echo "✅ HTTP worker-pool abandoned-client cleanup test passed"
+
+# Run HTTP worker-pool session-manager disconnect wiring test without opening IDA
+test-pool-manager-disconnect:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -x "{{ server_bin }}" ]; then
+        echo "Server binary not found: {{ server_bin }}"
+        echo "Run 'just build' first"
+        exit 1
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "jq is required for pool manager-disconnect test (brew install jq)"
+        exit 1
+    fi
+    echo "🧪 Running HTTP worker-pool session-manager disconnect wiring test..."
+    PORT=$((9700 + RANDOM % 500)) \
+        POOL_TEST_CASE=manager-disconnect \
+        RUST_LOG="{{ rust_log }}" IDB_PATH="{{ test_bin }}" \
+        MCP_HTTP_BIN="{{ server_bin }}" \
+        bash ./http_pool.sh
+    echo "✅ HTTP worker-pool session-manager disconnect wiring test passed"
+
+# Run IDAPython script integration test
+test-script: test-bootstrap
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -x "{{ server_bin }}" ]; then
+        echo "Server binary not found: {{ server_bin }}"
+        echo "Run 'cargo build --release' first"
+        exit 1
+    fi
+    LOCK="{{ test_lock }}"
+    if [ -f "$LOCK" ]; then
+        pid=$(awk -F= '$1=="pid"{print $2}' "$LOCK" | tr -d '\r')
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            echo "Lock file $LOCK is held by pid $pid; close that server first." >&2
+            exit 1
+        else
+            rm -f "$LOCK"
+        fi
+    fi
+    echo "🧪 Running IDAPython script test..."
+    RUST_LOG="{{ rust_log }}" MCP_HTTP_BIN="{{ server_bin }}" IDB_PATH="{{ test_i64 }}" bash ./http_script_integration.sh
+    echo "✅ Script test passed"
+
+# Run foreground observability integration test
+test-observability: test-bootstrap
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -x "{{ server_bin }}" ]; then
+        echo "Server binary not found: {{ server_bin }}"
+        echo "Run 'cargo build --release' first"
+        exit 1
+    fi
+    LOCK="{{ test_lock }}"
+    if [ -f "$LOCK" ]; then
+        pid=$(awk -F= '$1=="pid"{print $2}' "$LOCK" | tr -d '\r')
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            echo "Lock file $LOCK is held by pid $pid; close that server first." >&2
+            exit 1
+        else
+            rm -f "$LOCK"
+        fi
+    fi
+    echo "🧪 Running observability integration test..."
+    RUST_LOG="{{ rust_log }}" MCP_HTTP_BIN="{{ server_bin }}" IDB_PATH="{{ test_bin }}" bash ./http_observability.sh
+    echo "✅ Observability test passed"
+
+# Run open_idb auto-background elicitation integration test
+test-elicitation: fixture
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -x "{{ server_bin }}" ]; then
+        echo "Server binary not found: {{ server_bin }}"
+        echo "Run 'cargo build --release' first"
+        exit 1
+    fi
+    if ! command -v jq &>/dev/null; then
+        echo "jq is required for elicitation test (brew install jq)"
+        exit 1
+    fi
+    echo "🧪 Running elicitation auto-background integration test..."
+    RUST_LOG="{{ rust_log }}" MCP_STDIO_BIN="{{ server_bin }}" bash ./stdio_elicitation.sh
+    echo "✅ Elicitation test passed"
+
+# Verify the MCP 2026 discover lifecycle over stdio and stateless HTTP, plus
+# the explicit legacy-only pooled HTTP boundary.
+test-modern:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -x "{{ server_bin }}" ]; then
+        echo "Server binary not found: {{ server_bin }}"
+        echo "Run 'just build' first"
+        exit 1
+    fi
+    PORT=$((9400 + RANDOM % 400)) RUST_LOG="{{ rust_log }}" \
+        MCP_BIN="{{ server_bin }}" bash ./modern_protocol.sh
+
+# Run open_idb rebuild semantics test (Cases C and D from the rebuild=bool patch)
+# Phase 1 seeds a tmpdir .i64 with a renamed function via the raw-input path,
+# Phase 2 re-opens the raw path and asserts the rename survives (reuse),
+# Phase 3 re-opens with rebuild=true and asserts the rename is gone (overwrite).
+test-rebuild-idb: fixture
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -x "{{ server_bin }}" ]; then
+        echo "Server binary not found: {{ server_bin }}"
+        echo "Run 'cargo build --release' first"
+        exit 1
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "jq is required for rebuild-idb test (brew install jq)"
+        exit 1
+    fi
+    RUST_LOG="{{ rust_log }}" MCP_STDIO_BIN="{{ server_bin }}" \
+        bash ./stdio_rebuild_idb.sh
+
+# Run callees-indirect regression test (PR #20)
+# Builds a tiny C fixture with both a direct and an indirect call, opens it
+# at a bundle-id-style path, and checks that callees() returns only the direct
+# callee (no bogus entry from the indirect call's Mem/Displ operand).
+test-callees-indirect:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -x "{{ server_bin }}" ]; then
+        echo "Server binary not found: {{ server_bin }}"
+        echo "Run 'cargo build --release' first"
+        exit 1
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "jq is required for callees-indirect test (brew install jq)"
+        exit 1
+    fi
+    if ! command -v {{ cc }} >/dev/null 2>&1; then
+        echo "{{ cc }} is required to build the fixture"
+        exit 1
+    fi
+    echo "🧪 Running callees-indirect regression test..."
+    RUST_LOG="{{ rust_log }}" MCP_STDIO_BIN="{{ server_bin }}" CC="{{ cc }}" \
+        bash ./stdio_callees_indirect.sh
+    echo "✅ callees-indirect test passed"
+
+# Verify server-side tool filtering at the protocol level (Phase 2a)
+test-tool-filter:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -x "{{ server_bin }}" ]; then
+        echo "Server binary not found: {{ server_bin }}"
+        echo "Run 'just build' first"
+        exit 1
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "jq is required (brew install jq)"
+        exit 1
+    fi
+    echo "🧪 Running stdio tool-filter test..."
+    MCP_STDIO_BIN="{{ server_bin }}" RUST_LOG="{{ rust_log }}" \
+        bash ./stdio_tool_filter.sh
+    echo "✅ tool-filter test passed"
+
+# Measure tools/list payload size; useful for regression-watching
+# tool description bloat (issue: #11364). Set FAIL_OVER_CHARS=N to fail
+# the recipe when the total exceeds N (CI guard); leave unset to just print.
+measure-tools:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -x "{{ server_bin }}" ]; then
+        echo "Server binary not found: {{ server_bin }}"
+        echo "Run 'just build' first"
+        exit 1
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "jq is required (brew install jq)"
+        exit 1
+    fi
+    BIN="{{ server_bin }}" TOP="${TOP:-10}" \
+        FAIL_OVER_CHARS="${FAIL_OVER_CHARS:-0}" \
+        bash ./measure_tools.sh
+
+# Run crash-guard integration test
+# Verifies that SIGSEGV during a handler call is caught and converted to a
+# ToolError instead of killing the server. Triggers a real segfault via
+# IDAPython ctypes.string_at(0) and checks the session_id stays stable
+
+# across the crash (proof the server process didn't restart).
+test-crash-guard: test-bootstrap
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -x "{{ server_bin }}" ]; then
+        echo "Server binary not found: {{ server_bin }}"
+        exit 1
+    fi
+    if ! command -v jq &>/dev/null; then
+        echo "jq is required for crash-guard test (brew install jq)"
+        exit 1
+    fi
+    LOCK="{{ test_lock }}"
+    if [ -f "$LOCK" ]; then
+        pid=$(awk -F= '$1=="pid"{print $2}' "$LOCK" | tr -d '\r')
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            echo "Lock file $LOCK is held by pid $pid; close that server first." >&2
+            exit 1
+        else
+            rm -f "$LOCK"
+        fi
+    fi
+    echo "🧪 Running crash-guard integration test..."
+
+    fifo_in="$(mktemp -u).fifo"
+    mkfifo "$fifo_in"
+    log="$(mktemp)"
+
+    # Native open_idb / run_script surface: drive the worker subcommand, since
+    # the supervisor owns database lifecycle through idb_open / idb_close.
+    RUST_LOG="{{ rust_log }}" "{{ server_bin }}" worker < "$fifo_in" > "$log" 2>&1 &
+    server_pid=$!
+    exec 3>"$fifo_in"
+
+    cleanup() {
+        exec 3>&- || true
+        rm -f "$fifo_in"
+        kill "$server_pid" 2>/dev/null || true
+        wait "$server_pid" 2>/dev/null || true
+    }
+    trap cleanup EXIT
+
+    send() { echo "$1" >&3; }
+
+    wait_response() {
+        local target_id="$1"
+        local timeout="${2:-30}"
+        local elapsed=0
+        while [ "$elapsed" -lt "$timeout" ]; do
+            local line
+            line=$(grep -m1 "\"id\":${target_id}[,}]" "$log" 2>/dev/null | grep '"jsonrpc"' || true)
+            if [ -n "$line" ]; then
+                echo "$line"
+                return 0
+            fi
+            if ! kill -0 "$server_pid" 2>/dev/null; then
+                echo "   ❌ server process died waiting for id=$target_id" >&2
+                cat "$log" >&2
+                return 1
+            fi
+            sleep 1
+            elapsed=$((elapsed + 1))
+        done
+        echo "Timeout waiting for response id=$target_id" >&2
+        return 1
+    }
+
+    # Init
+    send '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"cg","version":"0.1"},"capabilities":{}}}'
+    send '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}'
+    wait_response 1 10 >/dev/null
+    echo "   initialized"
+
+    # Open the pre-built .i64 fixture
+    send '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"open_idb","arguments":{"path":"fixtures/mini.i64"}}}'
+    open_resp=$(wait_response 2 30)
+    session_before=$(echo "$open_resp" | jq -r '.result.content[0].text' | jq -r '.session_id // empty')
+    if [ -z "$session_before" ]; then
+        echo "❌ open_idb did not return a session_id"
+        echo "$open_resp" | jq .
+        exit 1
+    fi
+    echo "   opened session=${session_before:0:8}"
+
+    # Test 1: decompile at invalid address — clean error path through the guard
+    send '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"decompile","arguments":{"address":"0xDEADBEEF"}}}'
+    resp=$(wait_response 3 10)
+    text=$(echo "$resp" | jq -r '.result.content[0].text // empty')
+    echo "   decompile 0xDEADBEEF → ${text:0:60}"
+
+    # Test 2: deliberate SIGSEGV via IDAPython — Linux-only.
+    # macOS delivers EXC_BAD_ACCESS as a Mach exception which bypasses Unix
+    # signal handlers when IDA registers its own Mach handler. The crash guard
+    # works for IDA-internal crashes on both platforms (verified against
+    # kernelcache decompile) but this synthetic ctypes.string_at(0) path
+    # exercises signal-delivered SIGSEGV which only works on Linux.
+    if [ "$(uname -s)" = "Linux" ]; then
+        # Raise SIGSEGV synchronously on the IDA worker thread. Expected
+        # outcome: the signal is caught, an ERROR is logged, but the
+        # run_script response itself may be dropped (tokio foreground
+        # operation machinery is in a weird state after siglongjmp skipped
+        # its destructors). The real verification is that the SERVER is
+        # still alive and processing subsequent requests.
+        send '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"run_script","arguments":{"code":"import signal\nsignal.raise_signal(signal.SIGSEGV)"}}}'
+        sleep 3   # let the crash path complete and log the ERROR line
+        if ! grep -q 'crashed in IDA SDK (signal 11)\|signal 11 caught' "$log"; then
+            echo "❌ expected crash-guard catch message not in log" >&2
+            tail -20 "$log" >&2
+            exit 1
+        fi
+        echo "   SIGSEGV caught by guard (ERROR logged)"
+    else
+        echo "   (skipping forced SIGSEGV on macOS — Mach exceptions bypass signal handlers)"
+    fi
+
+    # Test 3: server is still alive and session_id is unchanged
+    # (this is the real proof the crash guard did its job — server survived
+    # the signal and can still process new requests on the same session)
+    send '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"analysis_status","arguments":{}}}'
+    resp=$(wait_response 5 15) || { echo "❌ server died or hung after Test 2"; exit 1; }
+    session_after=$(echo "$resp" | jq -r '.result.content[0].text' | jq -r '.session_id // empty')
+    if [ "$session_before" != "$session_after" ]; then
+        echo "❌ session_id changed: ${session_before:0:8} → ${session_after:0:8} (server restarted)"
+        exit 1
+    fi
+    echo "   server alive after crash, session_id stable: ${session_after:0:8}"
+
+    # Close
+    send '{"jsonrpc":"2.0","id":99,"method":"tools/call","params":{"name":"close_idb","arguments":{}}}'
+    wait_response 99 10 >/dev/null
+    echo "✅ Crash-guard test passed"
+
+dsc_test_path := env_var_or_default("DSC_TEST_PATH", "/tmp/ios_sys_mount/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64e")
+
+# Run dyld_shared_cache (DSC) integration test
+
+# Handles both sync (pre-existing .i64) and async (background task) paths.
+test-dsc dsc_path=dsc_test_path:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -x "{{ server_bin }}" ]; then
+        echo "Server binary not found: {{ server_bin }}"
+        echo "Run 'cargo build --release' first"
+        exit 1
+    fi
+    if ! command -v jq &>/dev/null; then
+        echo "jq is required for DSC test (brew install jq)"
+        exit 1
+    fi
+    echo "🧪 Running DSC integration test..."
+    echo "   DSC: {{ dsc_path }}"
+
+    fifo_in="$(mktemp -u).fifo"
+    mkfifo "$fifo_in"
+    log="$(mktemp)"
+
+    # open_dsc is worker-local: the supervisor owns database lifecycle and does
+    # not route it, so drive the native surface through the worker subcommand.
+    RUST_LOG="{{ rust_log }}" "{{ server_bin }}" worker < "$fifo_in" > "$log" 2>&1 &
+    server_pid=$!
+    # Open the write end of fifo (keeps it open so server doesn't see EOF)
+    exec 3>"$fifo_in"
+
+    cleanup() {
+        exec 3>&- || true
+        rm -f "$fifo_in"
+        kill "$server_pid" 2>/dev/null || true
+        wait "$server_pid" 2>/dev/null || true
+    }
+    trap cleanup EXIT
+
+    send() { echo "$1" >&3; }
+
+    # Wait for a JSON-RPC response with the given id.
+    # Reads from the log file, skipping log lines (which start with a timestamp).
+    wait_response() {
+        local target_id="$1"
+        local timeout="${2:-300}"
+        local elapsed=0
+        while [ "$elapsed" -lt "$timeout" ]; do
+            # Look for a JSON line with matching id
+            local line
+            line=$(grep -m1 "\"id\":${target_id}[,}]" "$log" 2>/dev/null | grep '"jsonrpc"' || true)
+            if [ -n "$line" ]; then
+                echo "$line"
+                return 0
+            fi
+            sleep 1
+            elapsed=$((elapsed + 1))
+        done
+        echo "Timeout waiting for response id=$target_id" >&2
+        return 1
+    }
+
+    # Phase 1: Initialize
+    send '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"dsc-test","version":"0.1"},"capabilities":{}}}'
+    send '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}'
+    wait_response 1 10 >/dev/null
+    echo "   Initialized"
+
+    # Phase 2: open_dsc
+    payload=$(sed "s|DSC_PATH|{{ dsc_path }}|g" <<< '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"open_dsc","arguments":{"path":"DSC_PATH","arch":"arm64e","module":"/System/Library/PrivateFrameworks/LockdownMode.framework/LockdownMode"}}}')
+    send "$payload"
+    resp=$(wait_response 2 30)
+    echo "   open_dsc responded"
+
+    # Check if we got a task_id (async) or direct db_info (sync)
+    content_text=$(echo "$resp" | jq -r '.result.content[0].text // empty')
+    task_id=$(echo "$content_text" | jq -r '.task_id // empty')
+
+    if [ -n "$task_id" ]; then
+        echo "   Background task: $task_id — polling task_status..."
+        poll_id=10
+        while true; do
+            send "{\"jsonrpc\":\"2.0\",\"id\":${poll_id},\"method\":\"tools/call\",\"params\":{\"name\":\"task_status\",\"arguments\":{\"task_id\":\"${task_id}\"}}}"
+            poll_resp=$(wait_response "$poll_id" 30)
+            poll_text=$(echo "$poll_resp" | jq -r '.result.content[0].text // empty')
+            status=$(echo "$poll_text" | jq -r '.status // empty')
+            message=$(echo "$poll_text" | jq -r '.message // empty')
+            elapsed_s=$(echo "$poll_text" | jq -r '.elapsed_secs // empty')
+            echo "   [$elapsed_s s] status=$status message=$message"
+
+            if [ "$status" = "completed" ]; then
+                echo "   Task completed"
+                # Legacy idat/.i64 opens usually return functions immediately.
+                # IDA 9.4's native dscu path can complete the image load before
+                # function analysis has produced entries, so accept a loaded
+                # DSC image as the direct-path success signal.
+                fc=$(echo "$poll_text" | jq -r '.result.function_count // empty')
+                dsc_loaded=$(echo "$poll_text" | jq -r '.result.loaded_images[0].loaded // false')
+                if { [ -z "$fc" ] || [ "$fc" = "0" ]; } && [ "$dsc_loaded" != "true" ]; then
+                    echo "❌ Completed DSC task had neither function_count nor loaded DSC image"
+                    cat "$log"
+                    exit 1
+                fi
+                echo "   function_count=${fc:-0} loaded_image=$dsc_loaded"
+                break
+            elif [ "$status" = "failed" ]; then
+                echo "❌ Task failed: $message"
+                cat "$log"
+                exit 1
+            fi
+
+            poll_id=$((poll_id + 1))
+            sleep 5
+        done
+    else
+        # Sync path — check for isError
+        is_error=$(echo "$resp" | jq -r '.result.isError // false')
+        if [ "$is_error" = "true" ]; then
+            echo "❌ open_dsc returned error: $content_text"
+            cat "$log"
+            exit 1
+        fi
+        fc=$(echo "$content_text" | jq -r '.function_count // empty')
+        echo "   Opened synchronously, function_count=$fc"
+    fi
+
+    # Phase 3: Snapshot function count and segments before adding dylib
+    send '{"jsonrpc":"2.0","id":100,"method":"tools/call","params":{"name":"idb_meta","arguments":{}}}'
+    meta_resp=$(wait_response 100 30)
+    meta_error=$(echo "$meta_resp" | jq -r '.result.isError // false')
+    if [ "$meta_error" = "true" ]; then
+        echo "❌ idb_meta failed after open"
+        echo "$meta_resp" | jq .
+        cat "$log"
+        exit 1
+    fi
+    meta_text=$(echo "$meta_resp" | jq -r '.result.content[0].text // empty')
+    fc_before=$(echo "$meta_text" | jq -r '.function_count // 0')
+    echo "   idb_meta OK — function_count=$fc_before"
+
+    send '{"jsonrpc":"2.0","id":101,"method":"tools/call","params":{"name":"segments","arguments":{}}}'
+    seg_resp=$(wait_response 101 30)
+    seg_error=$(echo "$seg_resp" | jq -r '.result.isError // false')
+    if [ "$seg_error" = "true" ]; then
+        echo "❌ segments failed after open"
+        echo "$seg_resp" | jq .
+        cat "$log"
+        exit 1
+    fi
+    seg_text=$(echo "$seg_resp" | jq -r '.result.content[0].text // empty')
+    seg_before=$(echo "$seg_text" | jq -r 'if type == "array" then length else .segments | length end // 0')
+    echo "   segments OK — count=$seg_before"
+
+    # Phase 4: dsc_add_dylib — load an additional framework
+    send '{"jsonrpc":"2.0","id":102,"method":"tools/call","params":{"name":"dsc_add_dylib","arguments":{"module":"/usr/lib/libSystem.B.dylib","timeout_secs":300}}}'
+    add_resp=$(wait_response 102 300)
+    add_error=$(echo "$add_resp" | jq -r '.result.isError // false')
+    if [ "$add_error" = "true" ]; then
+        echo "⚠️  dsc_add_dylib returned error (dscu plugin may not be available):"
+        echo "$add_resp" | jq -r '.result.content[0].text // empty'
+    else
+        add_text=$(echo "$add_resp" | jq -r '.result.content[0].text // empty')
+        add_ok=$(echo "$add_text" | jq -r '.success // false')
+        if [ "$add_ok" = "true" ]; then
+            echo "   dsc_add_dylib OK"
+        else
+            echo "⚠️  dsc_add_dylib did not report success: $add_text"
+        fi
+    fi
+
+    # Phase 5: Verify DB state changed after add
+    send '{"jsonrpc":"2.0","id":103,"method":"tools/call","params":{"name":"idb_meta","arguments":{}}}'
+    meta2_resp=$(wait_response 103 30)
+    meta2_text=$(echo "$meta2_resp" | jq -r '.result.content[0].text // empty')
+    fc_after=$(echo "$meta2_text" | jq -r '.function_count // 0')
+    echo "   After add: function_count=$fc_after (was $fc_before)"
+    if [ "$fc_after" -gt "$fc_before" ]; then
+        echo "   ✓ Function count increased by $((fc_after - fc_before))"
+    else
+        # Expected: this test never runs analyze_funcs, and functions only
+        # materialize after analysis. Segment count is the real assertion.
+        echo "   function count unchanged ($fc_before) — expected without analyze_funcs"
+    fi
+
+    send '{"jsonrpc":"2.0","id":104,"method":"tools/call","params":{"name":"segments","arguments":{}}}'
+    seg2_resp=$(wait_response 104 30)
+    seg2_text=$(echo "$seg2_resp" | jq -r '.result.content[0].text // empty')
+    seg_after=$(echo "$seg2_text" | jq -r 'if type == "array" then length else .segments | length end // 0')
+    echo "   After add: segments=$seg_after (was $seg_before)"
+    if [ "$seg_after" -gt "$seg_before" ]; then
+        echo "   ✓ Segment count increased by $((seg_after - seg_before))"
+    elif [ -n "$task_id" ]; then
+        # Fresh open: the added dylib was not present, so its segments must
+        # appear. No increase means dsc_add_dylib silently did nothing.
+        echo "❌ Segment count did not increase on a fresh open (before=$seg_before, after=$seg_after)"
+        cat "$log"
+        exit 1
+    else
+        # Reused database: the dylib usually persisted from an earlier run,
+        # so an idempotent re-add legitimately changes nothing.
+        echo "   segment count unchanged ($seg_before) — module already loaded in the reused database"
+    fi
+
+    # Phase 6: analysis_status sanity check
+    send '{"jsonrpc":"2.0","id":105,"method":"tools/call","params":{"name":"analysis_status","arguments":{}}}'
+    as_resp=$(wait_response 105 30)
+    as_error=$(echo "$as_resp" | jq -r '.result.isError // false')
+    if [ "$as_error" = "true" ]; then
+        echo "❌ analysis_status failed after add"
+        exit 1
+    fi
+    echo "   analysis_status OK"
+
+    # Phase 7: close
+    send '{"jsonrpc":"2.0","id":200,"method":"tools/call","params":{"name":"close_idb","arguments":{}}}'
+    wait_response 200 10 >/dev/null
+    echo "   close_idb OK"
+
+    echo "✅ DSC test passed"
+
+# Clean test artifacts
+clean:
+    rm -f "{{ test_bin }}"
+    rm -rf fixtures/mini.dSYM
+    rm -f fixtures/*.i64 fixtures/*.idb
+    rm -f fixtures/*.id0 fixtures/*.id1 fixtures/*.id2 fixtures/*.nam fixtures/*.til fixtures/*.imcp

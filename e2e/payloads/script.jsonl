@@ -1,0 +1,8 @@
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"script-test","version":"0.1"},"capabilities":{}}}
+{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"open_idb","arguments":{"path":"fixtures/mini"}}}
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"run_script","arguments":{"code":"import ida_funcs\nprint(f'inline_simple_ok function_count={ida_funcs.get_func_qty()}')"}}}
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"run_script","arguments":{"file":"fixtures/test_analysis.py"}}}
+{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"run_script","arguments":{"code":"import idautils\nimport ida_funcs\n\ndef _func_info(ea):\n    f = ida_funcs.get_func(ea)\n    if not f:\n        return None\n    return (ida_funcs.get_func_name(ea), f.size(), ea)\n\ninfos = [_func_info(ea) for ea in idautils.Functions()]\ninfos = [x for x in infos if x is not None]\ninfos.sort(key=lambda t: t[1], reverse=True)\nprint(f'complex_ok total={len(infos)} top={infos[:3]}')"}}}
+{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"run_script","arguments":{"code":"def broken(:\n    return 1"}}}
+{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"close_idb","arguments":{}}}

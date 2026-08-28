@@ -1,0 +1,37 @@
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"test","version":"0.1"},"capabilities":{}}}
+{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}
+{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"idb_open","arguments":{"input_path":"fixtures/mini.i64","preferred_session_id":"mini"}}}
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"tool_catalog","arguments":{"query":"decompile","database":"mini"}}}
+{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"tool_help","arguments":{"name":"disasm","database":"mini"}}}
+{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"load_debug_info","arguments":{"database":"mini"}}}
+{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"idb_meta","arguments":{"database":"mini"}}}
+{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"segments","arguments":{"database":"mini"}}}
+{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"list_functions","arguments":{"limit":20,"database":"mini"}}}
+{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"resolve_function","arguments":{"name":"interesting_function","database":"mini"}}}
+{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"addr_info","arguments":{"name":"interesting_function","database":"mini"}}}
+{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"function_at","arguments":{"name":"interesting_function","database":"mini"}}}
+{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"set_comments","arguments":{"name":"interesting_function","comment":"mcp test comment","repeatable":false,"database":"mini"}}}
+{"jsonrpc":"2.0","id":14,"method":"tools/call","params":{"name":"rename","arguments":{"current_name":"interesting_function","name":"interesting_function_renamed","flags":0,"database":"mini"}}}
+{"jsonrpc":"2.0","id":15,"method":"tools/call","params":{"name":"resolve_function","arguments":{"name":"interesting_function_renamed","database":"mini"}}}
+{"jsonrpc":"2.0","id":16,"method":"tools/call","params":{"name":"disasm_by_name","arguments":{"name":"interesting_function_renamed","count":20,"database":"mini"}}}
+{"jsonrpc":"2.0","id":17,"method":"tools/call","params":{"name":"disasm_function_at","arguments":{"name":"interesting_function_renamed","count":60,"database":"mini"}}}
+{"jsonrpc":"2.0","id":18,"method":"tools/call","params":{"name":"find_insns","arguments":{"patterns":["call"],"limit":5,"database":"mini"}}}
+{"jsonrpc":"2.0","id":19,"method":"tools/call","params":{"name":"find_insn_operands","arguments":{"patterns":["rsp"],"limit":5,"database":"mini"}}}
+{"jsonrpc":"2.0","id":22,"method":"tools/call","params":{"name":"get_bytes","arguments":{"name":"interesting_function_renamed","offset":0,"size":4,"database":"mini"}}}
+{"jsonrpc":"2.0","id":23,"method":"tools/call","params":{"name":"strings","arguments":{"limit":10,"database":"mini"}}}
+{"jsonrpc":"2.0","id":24,"method":"tools/call","params":{"name":"find_string","arguments":{"query":"result=","limit":10,"database":"mini"}}}
+{"jsonrpc":"2.0","id":25,"method":"tools/call","params":{"name":"xrefs_to_string","arguments":{"query":"result=","limit":5,"database":"mini"}}}
+{"jsonrpc":"2.0","id":26,"method":"tools/call","params":{"name":"local_types","arguments":{"limit":10,"database":"mini"}}}
+{"jsonrpc":"2.0","id":27,"method":"tools/call","params":{"name":"declare_type","arguments":{"decl":"typedef int mcp_int_t;","replace":true,"database":"mini"}}}
+{"jsonrpc":"2.0","id":28,"method":"tools/call","params":{"name":"apply_types","arguments":{"name":"interesting_function_renamed","decl":"int interesting_function_renamed(int a, int b);","strict":true,"database":"mini"}}}
+{"jsonrpc":"2.0","id":29,"method":"tools/call","params":{"name":"infer_types","arguments":{"name":"interesting_function_renamed","database":"mini"}}}
+{"jsonrpc":"2.0","id":31,"method":"tools/call","params":{"name":"declare_stack","arguments":{"name":"interesting_function_renamed","offset":-16,"var_name":"mcp_local","decl":"int mcp_local;","database":"mini"}}}
+{"jsonrpc":"2.0","id":32,"method":"tools/call","params":{"name":"apply_types","arguments":{"name":"interesting_function_renamed","stack_name":"mcp_local","decl":"int mcp_local;","strict":true,"database":"mini"}}}
+{"jsonrpc":"2.0","id":33,"method":"tools/call","params":{"name":"delete_stack","arguments":{"name":"interesting_function_renamed","var_name":"mcp_local","database":"mini"}}}
+{"jsonrpc":"2.0","id":34,"method":"tools/call","params":{"name":"structs","arguments":{"limit":10,"database":"mini"}}}
+{"jsonrpc":"2.0","id":36,"method":"tools/call","params":{"name":"search_structs","arguments":{"query":"struct","limit":10,"database":"mini"}}}
+{"jsonrpc":"2.0","id":37,"method":"tools/call","params":{"name":"imports","arguments":{"limit":10,"database":"mini"}}}
+{"jsonrpc":"2.0","id":38,"method":"tools/call","params":{"name":"exports","arguments":{"limit":10,"database":"mini"}}}
+{"jsonrpc":"2.0","id":39,"method":"tools/call","params":{"name":"analysis_status","arguments":{"database":"mini"}}}
+{"jsonrpc":"2.0","id":40,"method":"tools/call","params":{"name":"idb_close","arguments":{"database":"mini","save":false}}}

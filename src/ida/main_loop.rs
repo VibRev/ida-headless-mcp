@@ -1,0 +1,2366 @@
+//! Main IDA worker loop.
+
+use std::ffi::{c_char, CString, OsStr, OsString};
+use std::fs::{self, File};
+use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use idalib::IDB;
+use tracing::{debug, error, info, warn};
+
+use crate::error::ToolError;
+use crate::ida::handlers::resolve_address;
+use crate::ida::handlers::{
+    address, analysis, annotations, controlflow, database, definitions, disasm, dscu, functions,
+    globals, imports, lumina, memory, script, search, segments, signature, strings, structs, types,
+    warmup, xrefs,
+};
+use crate::ida::lock::release_mcp_lock;
+use crate::ida::observability::{
+    emit_progress, ensure_not_cancelled, ProgressHeartbeat, OPEN_IDB_PROGRESS_TOTAL,
+    SINGLE_PHASE_PROGRESS_TOTAL,
+};
+use crate::ida::query::FunctionQuery;
+#[cfg(target_os = "windows")]
+use crate::ida::registry_isolation::IsolatedWindowsRegistry;
+use crate::ida::request::{IdaRequest, SdkMutation};
+use crate::ida::types::{ConditionalCloseResult, DatabaseGeneration, OpenedDatabase};
+
+#[cfg(feature = "ida-94")]
+const AUTO_USE_LUMINA_REGISTRY_VALUE: &str = "AutoUseLumina";
+
+unsafe extern "C" {
+    fn qsetenv(varname: *const c_char, value: *const c_char) -> bool;
+}
+
+/// Log result with debug on success and warn on error.
+macro_rules! log_result {
+    ($result:expr, $ok_msg:literal, $err_msg:literal) => {
+        match &$result {
+            Ok(_) => debug!($ok_msg),
+            Err(e) => warn!(error = %e, $err_msg),
+        }
+    };
+}
+
+pub struct IdaInitState {
+    pub library_initialized: bool,
+    pub version_mismatch: Option<String>,
+    allow_lumina: bool,
+    isolated_idausr: Option<IsolatedIdaUserDir>,
+    #[cfg(target_os = "windows")]
+    isolated_registry: Option<IsolatedWindowsRegistry>,
+}
+
+impl IdaInitState {
+    pub fn deferred(allow_lumina: bool) -> Result<Self, String> {
+        Ok(Self {
+            library_initialized: false,
+            version_mismatch: None,
+            allow_lumina,
+            isolated_idausr: prepare_isolated_idausr(idalib::SDK_VERSION)?,
+            #[cfg(target_os = "windows")]
+            isolated_registry: None,
+        })
+    }
+}
+
+struct IsolatedIdaUserDir {
+    path: PathBuf,
+    previous_idausr: Option<OsString>,
+}
+
+impl Drop for IsolatedIdaUserDir {
+    fn drop(&mut self) {
+        if let Err(err) = set_idausr(self.previous_idausr.as_deref()) {
+            warn!(error = %err, "Failed to restore IDAUSR");
+            return;
+        }
+        if let Err(err) = fs::remove_dir_all(&self.path) {
+            debug!(
+                path = %self.path.display(),
+                error = %err,
+                "Failed to remove temporary IDA user directory"
+            );
+        }
+    }
+}
+
+fn os_str_to_cstring(value: &OsStr) -> Result<CString, String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+
+        CString::new(value.as_bytes()).map_err(|_| "IDAUSR contains a NUL byte".to_string())
+    }
+
+    #[cfg(not(unix))]
+    {
+        CString::new(value.to_string_lossy().as_bytes())
+            .map_err(|_| "IDAUSR contains a NUL byte".to_string())
+    }
+}
+
+fn set_idausr(value: Option<&OsStr>) -> Result<(), String> {
+    let value = value.map(os_str_to_cstring).transpose()?;
+    // qsetenv rejects a null value and uses an empty string to unset a variable.
+    let value_ptr = value.as_ref().map_or(c"".as_ptr(), |value| value.as_ptr());
+
+    // SAFETY: qsetenv is IDA's thread-safe environment API. Both pointers are
+    // backed by C strings that remain alive for the call.
+    if unsafe { qsetenv(c"IDAUSR".as_ptr(), value_ptr) } {
+        Ok(())
+    } else {
+        Err("IDA qsetenv rejected the IDAUSR update".to_string())
+    }
+}
+
+/// Check the IDA runtime version against the SDK we compiled with.
+///
+/// IDA 9.4+ must match the SDK minor because adjacent releases are not ABI
+/// compatible. Older SDKs retain the major-only check for IDA 9.3's product
+/// version reporting workaround.
+fn check_ida_version() -> Option<String> {
+    let (sdk_major, sdk_minor) = idalib::SDK_VERSION;
+    match idalib::version() {
+        Ok(v) => {
+            info!("IDA runtime version: {v} (compiled for SDK {sdk_major}.{sdk_minor})");
+            check_version_mismatch((sdk_major, sdk_minor), (v.major(), v.minor()))
+        }
+        Err(e) => {
+            warn!("Could not query IDA runtime version: {e}");
+            None
+        }
+    }
+}
+
+#[cfg(not(feature = "ida-92"))]
+fn check_license_expiry() -> Result<(), String> {
+    if let Ok(false) = idalib::is_valid_license() {
+        return Err(
+            "IDA license is invalid (is_valid_license() returned false). \
+             Check ida.hexlic / license server reachability."
+                .to_string(),
+        );
+    }
+    let end = match idalib::license_end_date() {
+        Ok(Some(ts)) => ts,
+        Ok(None) => {
+            info!("IDA license valid (no expiry date set)");
+            return Ok(());
+        }
+        Err(e) => {
+            warn!("Could not query IDA license expiry: {e}");
+            return Ok(());
+        }
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if end <= now {
+        let days_ago = (now - end) / 86_400;
+        return Err(format!(
+            "IDA license expired {days_ago} days ago (end_date={end}). \
+             Renew the license before opening databases; otherwise IDA's \
+             init_database() will terminate this process mid-open."
+        ));
+    }
+    let days_left = (end - now) / 86_400;
+    if days_left <= 7 {
+        warn!("IDA license expires in {days_left} days (end_date={end})");
+    } else {
+        info!("IDA license valid for {days_left} more days");
+    }
+    Ok(())
+}
+
+#[cfg(feature = "ida-92")]
+fn check_license_expiry() -> Result<(), String> {
+    if !idalib::is_valid_license() {
+        return Err(
+            "IDA license is invalid (is_valid_license() returned false). \
+             Check ida.hexlic / license server reachability."
+                .to_string(),
+        );
+    }
+    info!("IDA license valid; the IDA 9.2 bindings do not expose its expiry date");
+    Ok(())
+}
+
+fn should_check_license_expiry(sdk_version: (i32, i32)) -> bool {
+    sdk_version < (9, 4)
+}
+
+fn should_isolate_idausr(sdk_version: (i32, i32)) -> bool {
+    sdk_version >= (9, 2)
+}
+
+fn first_ida_user_dir(raw: &OsStr) -> (Option<PathBuf>, bool) {
+    let mut first = None;
+    let mut has_additional = false;
+    for path in std::env::split_paths(raw) {
+        if path.as_os_str().is_empty() {
+            continue;
+        }
+        if first.is_none() {
+            first = Some(path);
+        } else {
+            has_additional = true;
+        }
+    }
+    (first, has_additional)
+}
+
+fn ida_user_dir_source() -> Result<Option<PathBuf>, String> {
+    if let Some(raw) = std::env::var_os("IDAUSR") {
+        let (path, has_additional) = first_ida_user_dir(&raw);
+        let Some(path) = path else {
+            return Ok(None);
+        };
+        if has_additional {
+            warn!(
+                source = %path.display(),
+                "IDAUSR has multiple path components; isolating the first user directory and \
+                 omitting additional resource paths from the headless runtime"
+            );
+        }
+        return Ok(Some(path));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let Some(appdata) = std::env::var_os("APPDATA") else {
+            return Ok(None);
+        };
+        Ok(Some(
+            PathBuf::from(appdata).join("Hex-Rays").join("IDA Pro"),
+        ))
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let Some(home) = std::env::var_os("HOME") else {
+            return Ok(None);
+        };
+        Ok(Some(PathBuf::from(home).join(".idapro")))
+    }
+}
+
+fn unique_temp_idausr_dir() -> Result<PathBuf, String> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| format!("system clock is before UNIX_EPOCH: {err}"))?
+        .as_nanos();
+    let base = std::env::temp_dir();
+    let pid = std::process::id();
+
+    for attempt in 0..32 {
+        let candidate = base.join(format!("ida-mcp-idausr-{pid}-{now}-{attempt}"));
+        match fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(format!(
+                    "failed to create temporary IDA user directory {}: {err}",
+                    candidate.display()
+                ));
+            }
+        }
+    }
+
+    Err("failed to create a unique temporary IDA user directory".to_string())
+}
+
+fn copy_file(src: &Path, dst: &Path) -> Result<(), String> {
+    // fs::copy already duplicates the source permission bits, so there is no
+    // need to stat + chmod the destination afterwards.
+    fs::copy(src, dst).map_err(|err| {
+        format!(
+            "failed to copy IDA user file {} to {}: {err}",
+            src.display(),
+            dst.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
+    fs::create_dir(dst).map_err(|err| {
+        format!(
+            "failed to create IDA user directory copy {}: {err}",
+            dst.display()
+        )
+    })?;
+    copy_dir_contents(src, dst, None)
+}
+
+/// Copy the entries directly under `src` into `dst` (which must already exist).
+///
+/// `skip`, when set, is consulted only for entries at this level; nested
+/// directories are copied whole. A single entry that cannot be inspected or
+/// copied (unreadable file, dangling symlink) is logged and skipped rather
+/// than aborting the whole isolation.
+fn copy_dir_contents(
+    src: &Path,
+    dst: &Path,
+    skip: Option<&dyn Fn(&OsStr) -> bool>,
+) -> Result<(), String> {
+    let entries = fs::read_dir(src)
+        .map_err(|err| format!("failed to read IDA user directory {}: {err}", src.display()))?;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                warn!(
+                    directory = %src.display(),
+                    error = %err,
+                    "Skipping unreadable IDA user directory entry"
+                );
+                continue;
+            }
+        };
+        let name = entry.file_name();
+        if skip.is_some_and(|skip| skip(&name)) {
+            continue;
+        }
+        let source_path = entry.path();
+        let target_path = dst.join(&name);
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(err) => {
+                warn!(
+                    entry = %source_path.display(),
+                    error = %err,
+                    "Skipping IDA user entry that could not be inspected"
+                );
+                continue;
+            }
+        };
+        if let Err(err) = copy_ida_user_entry(&source_path, &target_path, file_type) {
+            warn!(
+                entry = %source_path.display(),
+                error = %err,
+                "Skipping IDA user entry that could not be copied"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn copy_ida_user_entry(src: &Path, dst: &Path, file_type: fs::FileType) -> Result<(), String> {
+    if file_type.is_file() {
+        copy_file(src, dst)
+    } else if file_type.is_dir() {
+        copy_dir_recursive(src, dst)
+    } else if file_type.is_symlink() {
+        copy_symlink_target(src, dst)
+    } else {
+        Ok(())
+    }
+}
+
+fn copy_symlink_target(src: &Path, dst: &Path) -> Result<(), String> {
+    let metadata = fs::metadata(src).map_err(|err| {
+        format!(
+            "failed to inspect IDA user symlink target {}: {err}",
+            src.display()
+        )
+    })?;
+
+    if metadata.is_file() {
+        copy_file(src, dst)
+    } else if metadata.is_dir() {
+        copy_dir_recursive(src, dst)
+    } else {
+        Ok(())
+    }
+}
+
+fn copy_ida_user_state(src: &Path, dst: &Path) -> Result<(), String> {
+    // Exclude the top-level `plugins/` directory from the isolated headless
+    // runtime. The live registry state caused the 9.4 `ida.reg` timeout; user
+    // plugins are separate process-local side effects that should not be loaded
+    // by the temporary runtime copy. Nested `plugins` directories are harmless
+    // and copied normally.
+    copy_dir_contents(src, dst, Some(&|name: &OsStr| name == "plugins"))
+}
+
+fn prepare_isolated_idausr(sdk_version: (i32, i32)) -> Result<Option<IsolatedIdaUserDir>, String> {
+    if !should_isolate_idausr(sdk_version) {
+        return Ok(None);
+    }
+
+    let path = unique_temp_idausr_dir()?;
+    let source = ida_user_dir_source()?;
+    if let Some(source) = source.as_ref() {
+        if source.exists() {
+            if let Err(err) = copy_ida_user_state(source, &path) {
+                let _ = fs::remove_dir_all(&path);
+                return Err(err);
+            }
+        } else {
+            warn!(
+                path = %source.display(),
+                "IDA user directory does not exist; using a fresh isolated profile"
+            );
+        }
+    } else {
+        warn!("Could not determine IDA user directory; using a fresh isolated profile");
+    }
+
+    let previous_idausr = std::env::var_os("IDAUSR");
+    if let Err(err) = set_idausr(Some(path.as_os_str())) {
+        let _ = fs::remove_dir_all(&path);
+        return Err(err);
+    }
+    if let Some(source) = source {
+        info!(
+            source = %source.display(),
+            isolated = %path.display(),
+            "Using isolated IDAUSR for the headless runtime"
+        );
+    } else {
+        info!(
+            isolated = %path.display(),
+            "Using fresh isolated IDAUSR for the headless runtime"
+        );
+    }
+
+    Ok(Some(IsolatedIdaUserDir {
+        path,
+        previous_idausr,
+    }))
+}
+
+#[cfg(feature = "ida-94")]
+fn configure_lumina(allow_lumina: bool, isolated_profile: bool) -> Result<(), String> {
+    if allow_lumina {
+        info!("Lumina access explicitly enabled");
+        return Ok(());
+    }
+
+    if !isolated_profile {
+        return Err(
+            "refusing to disable automatic Lumina in a shared IDA profile; profile isolation \
+             is unavailable. Pass --allow-lumina only if network access is acceptable."
+                .to_string(),
+        );
+    }
+
+    idalib::registry::set_bool(AUTO_USE_LUMINA_REGISTRY_VALUE, false)
+        .map_err(|err| format!("failed to disable automatic Lumina access: {err}"))?;
+    let auto_use_lumina = idalib::registry::get_bool(AUTO_USE_LUMINA_REGISTRY_VALUE, true)
+        .map_err(|err| format!("failed to verify automatic Lumina setting: {err}"))?;
+    if auto_use_lumina {
+        return Err("IDA did not retain the disabled automatic Lumina setting".to_string());
+    }
+
+    info!("Automatic Lumina access disabled; pass --allow-lumina to opt in");
+    Ok(())
+}
+
+#[cfg(not(feature = "ida-94"))]
+fn configure_lumina(allow_lumina: bool, isolated_profile: bool) -> Result<(), String> {
+    if allow_lumina {
+        info!("Lumina access explicitly enabled");
+        return Ok(());
+    }
+    if !isolated_profile {
+        return Err(
+            "refusing to use a shared IDA profile when automatic Lumina cannot be disabled; \
+             pass --allow-lumina only if network access is acceptable"
+                .to_string(),
+        );
+    }
+    warn!(
+        "The selected idalib version does not expose registry controls; \
+         relying on the isolated IDA profile to contain automatic Lumina state"
+    );
+    Ok(())
+}
+
+/// Initialize IDA on the main thread and record the version state.
+///
+/// `allow_lumina` controls whether IDA keeps its automatic Lumina lookups
+/// enabled; when false they are disabled before any database is opened.
+pub fn init_ida_library(allow_lumina: bool) -> Result<IdaInitState, String> {
+    init_ida_library_with_isolated_idausr(None, allow_lumina)
+}
+
+fn init_ida_library_with_isolated_idausr(
+    isolated_idausr: Option<IsolatedIdaUserDir>,
+    allow_lumina: bool,
+) -> Result<IdaInitState, String> {
+    let sdk_version = idalib::SDK_VERSION;
+    let isolated_idausr = match isolated_idausr {
+        Some(guard) => Some(guard),
+        None => prepare_isolated_idausr(sdk_version)?,
+    };
+    #[cfg(target_os = "windows")]
+    let isolated_registry = if allow_lumina {
+        None
+    } else {
+        Some(IsolatedWindowsRegistry::prepare()?)
+    };
+    info!("Initializing IDA library (main thread)");
+    #[cfg(feature = "ida-92")]
+    {
+        idalib::init_library();
+        idalib::enable_console_messages(false);
+    }
+    #[cfg(not(feature = "ida-92"))]
+    {
+        idalib::init_library().map_err(|e| format!("{e}"))?;
+        idalib::enable_console_messages(false).map_err(|e| format!("{e}"))?;
+    }
+
+    let version_mismatch = check_ida_version();
+    if let Some(ref msg) = version_mismatch {
+        error!("{msg}");
+    } else {
+        #[cfg(target_os = "windows")]
+        let lumina_profile_isolated = isolated_registry.is_some();
+        #[cfg(not(target_os = "windows"))]
+        let lumina_profile_isolated = isolated_idausr.is_some();
+        configure_lumina(allow_lumina, lumina_profile_isolated)?;
+        if should_check_license_expiry(sdk_version) {
+            check_license_expiry()?;
+        } else {
+            info!(
+                sdk_major = sdk_version.0,
+                sdk_minor = sdk_version.1,
+                "Skipping IDA license expiry preflight; IDA 9.4 validates the license during database open"
+            );
+        }
+    }
+
+    Ok(IdaInitState {
+        library_initialized: true,
+        version_mismatch,
+        allow_lumina,
+        isolated_idausr,
+        #[cfg(target_os = "windows")]
+        isolated_registry,
+    })
+}
+
+/// Run the IDA worker loop on the current (main) thread.
+/// This function blocks until Shutdown is received.
+pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
+    let mut idb: Option<IDB> = None;
+    let mut database_generation: Option<DatabaseGeneration> = None;
+    let mut next_database_generation = 0_u64;
+    let mut lock_file: Option<File> = None;
+    let mut lock_path: Option<PathBuf> = None;
+    let mut lib_initialized = init_state.library_initialized;
+    let mut version_mismatch = init_state.version_mismatch;
+    let allow_lumina = init_state.allow_lumina;
+    let mut isolated_idausr = init_state.isolated_idausr;
+    #[cfg(target_os = "windows")]
+    let mut _isolated_registry = init_state.isolated_registry;
+
+    while let Ok(req) = rx.recv() {
+        // Lazily initialize the IDA library on first use when startup preflight
+        // intentionally deferred initialization (non-Windows or HTTP mode).
+        if !lib_initialized {
+            if let Err(err) = ensure_not_cancelled(req.cancel_token()) {
+                reject_with_error(req, err);
+                continue;
+            }
+            info!("Initializing IDA library on main thread (deferred)");
+            let _heartbeat = ProgressHeartbeat::start(
+                req.progress_sender().cloned(),
+                "initializing",
+                0.0,
+                0.9,
+                Some(OPEN_IDB_PROGRESS_TOTAL),
+                "Initializing IDA runtime on the main thread",
+            );
+            match init_ida_library_with_isolated_idausr(isolated_idausr.take(), allow_lumina) {
+                Ok(init_state) => {
+                    lib_initialized = init_state.library_initialized;
+                    version_mismatch = init_state.version_mismatch;
+                    isolated_idausr = init_state.isolated_idausr;
+                    #[cfg(target_os = "windows")]
+                    {
+                        _isolated_registry = init_state.isolated_registry;
+                    }
+                }
+                Err(err) => {
+                    reject_with_error(
+                        req,
+                        ToolError::IdaError(format!(
+                            "failed to initialize IDA on the main thread: {err}"
+                        )),
+                    );
+                    continue;
+                }
+            }
+        }
+
+        // If there is a version mismatch, reject every request with a
+        // clear error instead of segfaulting deep inside IDA.
+        if let Some(ref mismatch_msg) = version_mismatch {
+            match req {
+                IdaRequest::Shutdown => {
+                    info!("Worker shutting down after SDK version mismatch");
+                    shutdown_cleanup(&mut idb, &mut lock_file, &mut lock_path);
+                    break;
+                }
+                other => {
+                    reject_with_version_error(other, mismatch_msg);
+                    continue;
+                }
+            }
+        }
+        match req {
+            IdaRequest::Open {
+                spec,
+                progress_tx,
+                cancel,
+                resp,
+            } => {
+                if let Err(err) = ensure_not_cancelled(cancel.as_ref()) {
+                    emit_progress(
+                        progress_tx.as_ref(),
+                        "cancelled",
+                        0.0,
+                        Some(OPEN_IDB_PROGRESS_TOTAL),
+                        "open_idb cancelled before opening database",
+                    );
+                    let _ = resp.send(Err(err));
+                    continue;
+                }
+                info!(
+                    path = %spec.path,
+                    force = spec.force,
+                    rebuild = spec.rebuild,
+                    file_type = ?spec.file_type,
+                    auto_analyse = spec.auto_analyse,
+                    "Opening database"
+                );
+                let had_open_database = idb.is_some();
+                let result = database::handle_open(
+                    &mut idb,
+                    &mut lock_file,
+                    &mut lock_path,
+                    &spec,
+                    progress_tx.clone(),
+                    cancel.clone(),
+                );
+                let result = result.and_then(|info| {
+                    let generation = match database_generation {
+                        Some(generation) if had_open_database => generation,
+                        _ => {
+                            let Some(next) = next_database_generation.checked_add(1) else {
+                                drop(idb.take());
+                                release_mcp_lock(&mut lock_file, &mut lock_path);
+                                return Err(ToolError::IdaError(
+                                    "database generation counter exhausted".to_string(),
+                                ));
+                            };
+                            next_database_generation = next;
+                            let generation = DatabaseGeneration(next);
+                            database_generation = Some(generation);
+                            generation
+                        }
+                    };
+                    Ok(OpenedDatabase { info, generation })
+                });
+                match &result {
+                    Ok(opened) => {
+                        emit_progress(
+                            progress_tx.as_ref(),
+                            "completed",
+                            OPEN_IDB_PROGRESS_TOTAL,
+                            Some(OPEN_IDB_PROGRESS_TOTAL),
+                            format!("Opened database {}", opened.info.path),
+                        );
+                        info!(
+                            path = %opened.info.path,
+                            processor = %opened.info.processor,
+                            bits = opened.info.bits,
+                            functions = opened.info.function_count,
+                            database_generation = opened.generation.0,
+                            "Database opened"
+                        );
+                    }
+                    Err(ToolError::Cancelled(message)) => {
+                        emit_progress(
+                            progress_tx.as_ref(),
+                            "cancelled",
+                            0.0,
+                            Some(OPEN_IDB_PROGRESS_TOTAL),
+                            message.clone(),
+                        );
+                        warn!(path = %spec.path, error = %message, "open_idb cancelled");
+                    }
+                    Err(e) => {
+                        emit_progress(
+                            progress_tx.as_ref(),
+                            "failed",
+                            0.0,
+                            Some(OPEN_IDB_PROGRESS_TOTAL),
+                            format!("open_idb failed: {e}"),
+                        );
+                        error!(path = %spec.path, error = %e, "Failed to open database");
+                    }
+                }
+                let _ = resp.send(result);
+            }
+            IdaRequest::Warmup {
+                build_caches,
+                init_hexrays,
+                resp,
+            } => {
+                debug!(build_caches, init_hexrays, "Running post-open warmup");
+                let result = crate::crash_guard::crash_guarded("handle_warmup", || {
+                    warmup::handle_warmup(&idb, build_caches, init_hexrays)
+                });
+                match &result {
+                    Ok(warmup) => debug!(
+                        ok = warmup.ok,
+                        steps = warmup.steps.len(),
+                        "Finished post-open warmup"
+                    ),
+                    Err(e) => warn!(error = %e, "Failed post-open warmup"),
+                }
+                let _ = resp.send(result);
+            }
+            IdaRequest::Close { save, resp } => {
+                info!(save, "Closing database");
+                if let Some(ref mut db) = idb {
+                    info!(path = %db.path().display(), "Dropping IDB (will call close_database_with(save))");
+                    db.save_on_close(save);
+                }
+                drop(idb.take());
+                database_generation = None;
+                info!("IDB dropped, database should be packed");
+                release_mcp_lock(&mut lock_file, &mut lock_path);
+                let _ = resp.send(());
+            }
+            IdaRequest::CloseIfGeneration { generation, resp } => {
+                if database_generation == Some(generation) {
+                    info!(
+                        database_generation = generation.0,
+                        "Closing matching database generation"
+                    );
+                    drop(idb.take());
+                    database_generation = None;
+                    release_mcp_lock(&mut lock_file, &mut lock_path);
+                    let _ = resp.send(Ok(ConditionalCloseResult::Closed));
+                } else {
+                    debug!(
+                        expected_generation = generation.0,
+                        current_generation = database_generation.map(|current| current.0),
+                        "Skipping conditional close for a stale database generation"
+                    );
+                    let _ = resp.send(Ok(ConditionalCloseResult::NotCurrent));
+                }
+            }
+            IdaRequest::LoadDebugInfo {
+                path,
+                verbose,
+                resp,
+            } => {
+                debug!(path = ?path, verbose, "Loading debug info");
+                let result = crate::crash_guard::crash_guarded("handle_load_debug_info", || {
+                    database::handle_load_debug_info(&idb, path.as_deref(), verbose)
+                });
+                match &result {
+                    Ok(v) => debug!(result = %v, "Loaded debug info"),
+                    Err(e) => warn!(error = %e, "Failed to load debug info"),
+                }
+                let _ = resp.send(result);
+            }
+            IdaRequest::AnalysisStatus {
+                expected_generation,
+                resp,
+            } => {
+                if let Err(err) = require_generation(expected_generation, database_generation) {
+                    let _ = resp.send(Err(err));
+                    continue;
+                }
+                debug!("Reporting analysis status");
+                let result = crate::crash_guard::crash_guarded("handle_analysis_status", || {
+                    analysis::handle_analysis_status(&idb)
+                });
+                match &result {
+                    Ok(status) => debug!(
+                        auto_enabled = status.auto_enabled,
+                        auto_is_ok = status.auto_is_ok,
+                        auto_state = %status.auto_state,
+                        "Analysis status reported"
+                    ),
+                    Err(e) => warn!(error = %e, "Failed to report analysis status"),
+                }
+                let _ = resp.send(result);
+            }
+            IdaRequest::DscLoadImage {
+                module,
+                expected_generation,
+                resp,
+            } => {
+                if let Err(err) = require_generation(expected_generation, database_generation) {
+                    let _ = resp.send(Err(err));
+                    continue;
+                }
+                debug!(module = %module, "Loading DSC image");
+                let result = crate::crash_guard::crash_guarded("handle_dsc_load_image", || {
+                    dscu::handle_dsc_load_image(&idb, &module)
+                });
+                match &result {
+                    Ok(image) => debug!(
+                        module = %image.name,
+                        address = %image.address,
+                        loaded = image.loaded,
+                        "Loaded DSC image"
+                    ),
+                    Err(e) => warn!(module = %module, error = %e, "Failed to load DSC image"),
+                }
+                let _ = resp.send(result);
+            }
+            IdaRequest::DscLoadRegion { addr, resp } => {
+                debug!(address = format!("{addr:#x}"), "Loading DSC region");
+                let result = crate::crash_guard::crash_guarded("handle_dsc_load_region", || {
+                    dscu::handle_dsc_load_region(&idb, addr)
+                });
+                match &result {
+                    Ok(region) => debug!(
+                        start = %region.start,
+                        kind = %region.kind,
+                        loaded = region.loaded,
+                        "Loaded DSC region"
+                    ),
+                    Err(e) => {
+                        warn!(address = format!("{addr:#x}"), error = %e, "Failed to load DSC region")
+                    }
+                }
+                let _ = resp.send(result);
+            }
+            IdaRequest::ListFunctions { query, resp } => {
+                debug!(
+                    offset = query.offset,
+                    limit = query.limit,
+                    filter = ?query.filter,
+                    regex = ?query.regex,
+                    sort_by = ?query.sort_by,
+                    "Listing functions"
+                );
+                let result = functions::handle_list_functions(&idb, &query);
+                match &result {
+                    Ok(r) => debug!(
+                        count = r.functions.len(),
+                        total = r.total,
+                        "Listed functions"
+                    ),
+                    Err(e) => warn!(error = %e, "Failed to list functions"),
+                }
+                let _ = resp.send(result);
+            }
+            IdaRequest::ResolveFunction { name, resp } => {
+                debug!(name = %name, "Resolving function");
+                let result = crate::crash_guard::crash_guarded("handle_resolve_function", || {
+                    functions::handle_resolve_function(&idb, &name)
+                });
+                match &result {
+                    Ok(info) => {
+                        debug!(name = %info.name, address = %info.address, "Resolved function")
+                    }
+                    Err(e) => warn!(name = %name, error = %e, "Failed to resolve function"),
+                }
+                let _ = resp.send(result);
+            }
+            IdaRequest::DisasmByName { name, count, resp } => {
+                debug!(name = %name, count, "Disassembling by name");
+                let result = crate::crash_guard::crash_guarded("handle_disasm_by_name", || {
+                    disasm::handle_disasm_by_name(&idb, &name, count)
+                });
+                match &result {
+                    Ok(text) => {
+                        debug!(name = %name, lines = text.lines().count(), "Disassembly complete")
+                    }
+                    Err(e) => warn!(name = %name, error = %e, "Failed to disassemble"),
+                }
+                let _ = resp.send(result);
+            }
+            IdaRequest::Disasm { addr, count, resp } => {
+                debug!(address = format!("{:#x}", addr), count, "Disassembling");
+                let result = crate::crash_guard::crash_guarded("handle_disasm", || {
+                    disasm::handle_disasm(&idb, addr, count)
+                });
+                match &result {
+                    Ok(text) => debug!(lines = text.lines().count(), "Disassembly complete"),
+                    Err(e) => {
+                        warn!(address = format!("{:#x}", addr), error = %e, "Failed to disassemble")
+                    }
+                }
+                let _ = resp.send(result);
+            }
+            IdaRequest::Decompile { addr, resp } => {
+                debug!(address = format!("{:#x}", addr), "Decompiling");
+                let result = crate::crash_guard::crash_guarded("handle_decompile", || {
+                    disasm::handle_decompile(&idb, addr)
+                });
+                match &result {
+                    Ok(code) => debug!(lines = code.lines().count(), "Decompilation complete"),
+                    Err(e) => {
+                        warn!(address = format!("{:#x}", addr), error = %e, "Failed to decompile")
+                    }
+                }
+                let _ = resp.send(result);
+            }
+            IdaRequest::Segments { resp } => {
+                debug!("Listing segments");
+                let result = crate::crash_guard::crash_guarded("handle_segments", || {
+                    segments::handle_segments(&idb)
+                });
+                match &result {
+                    Ok(segs) => debug!(count = segs.len(), "Listed segments"),
+                    Err(e) => warn!(error = %e, "Failed to list segments"),
+                }
+                let _ = resp.send(result);
+            }
+            IdaRequest::Strings { query, resp } => {
+                debug!(
+                    offset = query.offset,
+                    limit = query.limit,
+                    filter = ?query.filter,
+                    regex = ?query.regex,
+                    "Listing strings"
+                );
+                let result = crate::crash_guard::crash_guarded("handle_strings", || {
+                    strings::handle_strings(&idb, &query)
+                });
+                match &result {
+                    Ok(r) => debug!(count = r.strings.len(), total = r.total, "Listed strings"),
+                    Err(e) => warn!(error = %e, "Failed to list strings"),
+                }
+                let _ = resp.send(result);
+            }
+            IdaRequest::LocalTypes { query, resp } => {
+                debug!(
+                    offset = query.offset,
+                    limit = query.limit,
+                    kind = ?query.kind,
+                    "Listing local types"
+                );
+                let result = crate::crash_guard::crash_guarded("handle_local_types", || {
+                    types::handle_local_types(&idb, &query)
+                });
+                match &result {
+                    Ok(r) => debug!(count = r.types.len(), total = r.total, "Listed local types"),
+                    Err(e) => warn!(error = %e, "Failed to list local types"),
+                }
+                let _ = resp.send(result);
+            }
+            IdaRequest::DeclareType {
+                decl,
+                relaxed,
+                replace,
+                multi,
+                resp,
+            } => {
+                debug!(relaxed, replace, multi, "Declaring type");
+                let result = crate::crash_guard::crash_guarded("handle_declare_type", || {
+                    types::handle_declare_type(&idb, &decl, relaxed, replace, multi)
+                });
+                log_result!(result, "Declared type", "Failed to declare type");
+                let _ = resp.send(result);
+            }
+            IdaRequest::ApplyTypes {
+                addr,
+                name,
+                offset,
+                stack_offset,
+                stack_name,
+                decl,
+                type_name,
+                relaxed,
+                delay,
+                strict,
+                resp,
+            } => {
+                debug!(
+                    address = ?addr,
+                    name = ?name,
+                    offset,
+                    stack_offset = ?stack_offset,
+                    stack_name = ?stack_name,
+                    relaxed,
+                    delay,
+                    strict,
+                    "Applying type"
+                );
+                let result = crate::crash_guard::crash_guarded("handle_apply_types", || {
+                    types::handle_apply_types(
+                        &idb,
+                        addr,
+                        name.as_deref(),
+                        offset,
+                        stack_offset,
+                        stack_name.as_deref(),
+                        decl.as_deref(),
+                        type_name.as_deref(),
+                        relaxed,
+                        delay,
+                        strict,
+                    )
+                });
+                log_result!(result, "Applied type", "Failed to apply type");
+                let _ = resp.send(result);
+            }
+            IdaRequest::InferTypes {
+                addr,
+                name,
+                offset,
+                resp,
+            } => {
+                debug!(address = ?addr, name = ?name, offset, "Inferring type");
+                let result = crate::crash_guard::crash_guarded("handle_infer_types", || {
+                    types::handle_infer_types(&idb, addr, name.as_deref(), offset)
+                });
+                match &result {
+                    Ok(res) => debug!(code = res.code, "Inferred type"),
+                    Err(e) => warn!(error = %e, "Failed to infer type"),
+                }
+                let _ = resp.send(result);
+            }
+            IdaRequest::AddrInfo {
+                addr,
+                name,
+                offset,
+                resp,
+            } => {
+                debug!(address = ?addr, name = ?name, offset, "Getting address info");
+                let resolved = resolve_address(&idb, addr, name.as_deref(), offset);
+                let result = resolved.and_then(|ea| address::handle_addr_info(&idb, ea));
+                log_result!(result, "Got address info", "Failed to get address info");
+                let _ = resp.send(result);
+            }
+            IdaRequest::FunctionAt {
+                addr,
+                name,
+                offset,
+                resp,
+            } => {
+                debug!(address = ?addr, name = ?name, offset, "Getting function at address");
+                let resolved = resolve_address(&idb, addr, name.as_deref(), offset);
+                let result = resolved.and_then(|ea| functions::handle_function_at(&idb, ea));
+                log_result!(
+                    result,
+                    "Got function at address",
+                    "Failed to get function at address"
+                );
+                let _ = resp.send(result);
+            }
+            IdaRequest::DisasmFunctionAt {
+                addr,
+                name,
+                offset,
+                count,
+                resp,
+            } => {
+                debug!(
+                    address = ?addr,
+                    name = ?name,
+                    offset,
+                    count,
+                    "Disassembling function at address"
+                );
+                let resolved = resolve_address(&idb, addr, name.as_deref(), offset);
+                let result =
+                    resolved.and_then(|ea| disasm::handle_disasm_function_at(&idb, ea, count));
+                log_result!(
+                    result,
+                    "Disassembled function",
+                    "Failed to disassemble function"
+                );
+                let _ = resp.send(result);
+            }
+            IdaRequest::DeclareStack {
+                addr,
+                name,
+                offset,
+                var_name,
+                decl,
+                relaxed,
+                resp,
+            } => {
+                debug!(
+                    address = ?addr,
+                    name = ?name,
+                    offset,
+                    var_name = ?var_name,
+                    relaxed,
+                    "Declaring stack variable"
+                );
+                let result = crate::crash_guard::crash_guarded("handle_declare_stack", || {
+                    types::handle_declare_stack(
+                        &idb,
+                        addr,
+                        name.as_deref(),
+                        offset,
+                        var_name.as_deref(),
+                        &decl,
+                        relaxed,
+                    )
+                });
+                match &result {
+                    Ok(res) => debug!(code = res.code, "Declared stack variable"),
+                    Err(e) => warn!(error = %e, "Failed to declare stack variable"),
+                }
+                let _ = resp.send(result);
+            }
+            IdaRequest::DeleteStack {
+                addr,
+                name,
+                offset,
+                var_name,
+                resp,
+            } => {
+                debug!(
+                    address = ?addr,
+                    name = ?name,
+                    offset = ?offset,
+                    var_name = ?var_name,
+                    "Deleting stack variable"
+                );
+                let result = crate::crash_guard::crash_guarded("handle_delete_stack", || {
+                    types::handle_delete_stack(
+                        &idb,
+                        addr,
+                        name.as_deref(),
+                        offset,
+                        var_name.as_deref(),
+                    )
+                });
+                match &result {
+                    Ok(res) => debug!(code = res.code, "Deleted stack variable"),
+                    Err(e) => warn!(error = %e, "Failed to delete stack variable"),
+                }
+                let _ = resp.send(result);
+            }
+            IdaRequest::StackFrame { addr, resp } => {
+                debug!(address = format!("{:#x}", addr), "Getting stack frame");
+                let result = crate::crash_guard::crash_guarded("handle_stack_frame", || {
+                    types::handle_stack_frame(&idb, addr)
+                });
+                match &result {
+                    Ok(r) => debug!(members = r.members.len(), "Got stack frame"),
+                    Err(e) => warn!(error = %e, "Failed to get stack frame"),
+                }
+                let _ = resp.send(result);
+            }
+            IdaRequest::Structs { query, resp } => {
+                debug!(
+                    offset = query.offset,
+                    limit = query.limit,
+                    kind = ?query.kind,
+                    "Listing structs"
+                );
+                let result = crate::crash_guard::crash_guarded("handle_structs", || {
+                    structs::handle_structs(&idb, &query)
+                });
+                match &result {
+                    Ok(r) => debug!(count = r.structs.len(), total = r.total, "Listed structs"),
+                    Err(e) => warn!(error = %e, "Failed to list structs"),
+                }
+                let _ = resp.send(result);
+            }
+            IdaRequest::StructInfo {
+                ordinal,
+                name,
+                resp,
+            } => {
+                debug!(ordinal = ?ordinal, name = ?name, "Getting struct info");
+                let result = crate::crash_guard::crash_guarded("handle_struct_info", || {
+                    structs::handle_struct_info(&idb, ordinal, name.as_deref())
+                });
+                match &result {
+                    Ok(info) => {
+                        debug!(name = %info.name, ordinal = info.ordinal, "Got struct info")
+                    }
+                    Err(e) => warn!(error = %e, "Failed to get struct info"),
+                }
+                let _ = resp.send(result);
+            }
+            IdaRequest::ReadStruct {
+                addr,
+                ordinal,
+                name,
+                resp,
+            } => {
+                debug!(address = format!("{:#x}", addr), ordinal = ?ordinal, name = ?name, "Reading struct");
+                let result = crate::crash_guard::crash_guarded("handle_read_struct", || {
+                    structs::handle_read_struct(&idb, addr, ordinal, name.as_deref())
+                });
+                match &result {
+                    Ok(info) => debug!(name = %info.name, ordinal = info.ordinal, "Read struct"),
+                    Err(e) => warn!(error = %e, "Failed to read struct"),
+                }
+                let _ = resp.send(result);
+            }
+            IdaRequest::XRefsTo { addr, query, resp } => {
+                debug!(address = format!("{addr:#x}"), kind = ?query.kind, "Getting xrefs to");
+                let result = crate::crash_guard::crash_guarded("handle_xrefs_to", || {
+                    xrefs::handle_xrefs_to(&idb, addr, &query)
+                });
+                match &result {
+                    Ok(refs) => {
+                        debug!(
+                            count = refs.xrefs.len(),
+                            truncated = refs.truncated,
+                            "Got xrefs to"
+                        )
+                    }
+                    Err(e) => warn!(error = %e, "Failed to get xrefs"),
+                }
+                let _ = resp.send(result);
+            }
+            IdaRequest::XRefsFrom { addr, query, resp } => {
+                debug!(address = format!("{addr:#x}"), kind = ?query.kind, "Getting xrefs from");
+                let result = crate::crash_guard::crash_guarded("handle_xrefs_from", || {
+                    xrefs::handle_xrefs_from(&idb, addr, &query)
+                });
+                match &result {
+                    Ok(refs) => debug!(
+                        count = refs.xrefs.len(),
+                        truncated = refs.truncated,
+                        "Got xrefs from"
+                    ),
+                    Err(e) => warn!(error = %e, "Failed to get xrefs"),
+                }
+                let _ = resp.send(result);
+            }
+            IdaRequest::XRefsToField {
+                ordinal,
+                name,
+                member_index,
+                member_name,
+                limit,
+                resp,
+            } => {
+                debug!(
+                    ordinal = ?ordinal,
+                    name = ?name,
+                    member_index = ?member_index,
+                    member_name = ?member_name,
+                    limit,
+                    "Getting xrefs to struct field"
+                );
+                let result = crate::crash_guard::crash_guarded("handle_xrefs_to_field", || {
+                    structs::handle_xrefs_to_field(
+                        &idb,
+                        ordinal,
+                        name.as_deref(),
+                        member_index,
+                        member_name.as_deref(),
+                        limit,
+                    )
+                });
+                match &result {
+                    Ok(refs) => debug!(count = refs.xrefs.len(), "Got xrefs to struct field"),
+                    Err(e) => warn!(error = %e, "Failed to get xrefs to struct field"),
+                }
+                let _ = resp.send(result);
+            }
+            IdaRequest::Imports { query, resp } => {
+                debug!(
+                    offset = query.offset,
+                    limit = query.limit,
+                    "Listing imports"
+                );
+                let result = crate::crash_guard::crash_guarded("handle_imports", || {
+                    imports::handle_imports(&idb, &query)
+                });
+                match &result {
+                    Ok(imps) => debug!(count = imps.imports.len(), "Listed imports"),
+                    Err(e) => warn!(error = %e, "Failed to list imports"),
+                }
+                let _ = resp.send(result);
+            }
+            IdaRequest::Exports { query, resp } => {
+                debug!(
+                    offset = query.offset,
+                    limit = query.limit,
+                    "Listing exports"
+                );
+                let result = crate::crash_guard::crash_guarded("handle_exports", || {
+                    imports::handle_exports(&idb, &query)
+                });
+                match &result {
+                    Ok(exps) => debug!(count = exps.exports.len(), "Listed exports"),
+                    Err(e) => warn!(error = %e, "Failed to list exports"),
+                }
+                let _ = resp.send(result);
+            }
+            IdaRequest::Entrypoints { resp } => {
+                debug!("Listing entrypoints");
+                let result = crate::crash_guard::crash_guarded("handle_entrypoints", || {
+                    imports::handle_entrypoints(&idb)
+                });
+                match &result {
+                    Ok(eps) => debug!(count = eps.len(), "Listed entrypoints"),
+                    Err(e) => warn!(error = %e, "Failed to list entrypoints"),
+                }
+                let _ = resp.send(result);
+            }
+            IdaRequest::LuminaLookup {
+                addr,
+                name,
+                offset,
+                resp,
+            } => {
+                debug!(address = ?addr, name = ?name, offset, "Looking up Lumina metadata");
+                let result = crate::crash_guard::crash_guarded("handle_lumina_lookup", || {
+                    lumina::handle_pull(
+                        &idb,
+                        allow_lumina,
+                        addr,
+                        name.as_deref(),
+                        offset,
+                        false,
+                        false,
+                    )
+                });
+                log_result!(
+                    result,
+                    "Lumina metadata lookup completed",
+                    "Lumina metadata lookup failed"
+                );
+                let _ = resp.send(result);
+            }
+            IdaRequest::LuminaApply {
+                addr,
+                name,
+                offset,
+                force,
+                resp,
+            } => {
+                debug!(address = ?addr, name = ?name, offset, force, "Applying Lumina metadata");
+                let result = crate::crash_guard::crash_guarded("handle_lumina_apply", || {
+                    lumina::handle_pull(
+                        &idb,
+                        allow_lumina,
+                        addr,
+                        name.as_deref(),
+                        offset,
+                        true,
+                        force,
+                    )
+                });
+                log_result!(
+                    result,
+                    "Lumina metadata application completed",
+                    "Lumina metadata application failed"
+                );
+                let _ = resp.send(result);
+            }
+            IdaRequest::GetBytes {
+                addr,
+                name,
+                offset,
+                size,
+                resp,
+            } => {
+                let addr_log = addr
+                    .map(|a| format!("{a:#x}"))
+                    .unwrap_or_else(|| "none".to_string());
+                debug!(
+                    address = addr_log,
+                    name = ?name,
+                    offset,
+                    size,
+                    "Getting bytes"
+                );
+                let result = crate::crash_guard::crash_guarded("handle_get_bytes", || {
+                    memory::handle_get_bytes(&idb, addr, name.as_deref(), offset, size)
+                });
+                match &result {
+                    Ok(b) => debug!(length = b.length, "Got bytes"),
+                    Err(e) => warn!(error = %e, "Failed to get bytes"),
+                }
+                let _ = resp.send(result);
+            }
+            IdaRequest::AddBookmark {
+                addr,
+                description,
+                resp,
+            } => {
+                debug!(address = format!("{addr:#x}"), "Adding bookmark");
+                let result = crate::crash_guard::crash_guarded("handle_add_bookmark", || {
+                    annotations::handle_add_bookmark(&idb, addr, &description)
+                });
+                if let Err(error) = &result {
+                    warn!(error = %error, "Failed to add bookmark");
+                }
+                let _ = resp.send(result);
+            }
+            IdaRequest::SdkMutation { mutation, resp } => {
+                let result =
+                    crate::crash_guard::crash_guarded("handle_sdk_mutation", || match mutation {
+                        SdkMutation::Save { path } => {
+                            definitions::handle_idb_save(&idb, path.as_deref())
+                        }
+                        SdkMutation::DefineFunc { start, end } => {
+                            definitions::handle_define_func(&idb, start, end)
+                        }
+                        SdkMutation::DefineCode { address } => {
+                            definitions::handle_define_code(&idb, address)
+                        }
+                        SdkMutation::Undefine { address, size } => {
+                            definitions::handle_undefine(&idb, address, size)
+                        }
+                        SdkMutation::Reanalyze { start, end } => {
+                            definitions::handle_reanalyze(&idb, start, end)
+                        }
+                        SdkMutation::MarkCfuncDirty { address } => {
+                            definitions::handle_mark_cfunc_dirty(&idb, address)
+                        }
+                        SdkMutation::EnumUpsertMember {
+                            enum_name,
+                            member_name,
+                            value,
+                            bitfield,
+                        } => definitions::handle_enum_upsert_member(
+                            &idb,
+                            &enum_name,
+                            &member_name,
+                            value,
+                            bitfield,
+                        ),
+                        SdkMutation::RenameVariable {
+                            function_address,
+                            old_name,
+                            new_name,
+                            stack,
+                        } => definitions::handle_rename_variable(
+                            &idb,
+                            function_address,
+                            &old_name,
+                            &new_name,
+                            stack,
+                        ),
+                        SdkMutation::SurveyMetrics {
+                            function_addresses,
+                            string_addresses,
+                        } => definitions::handle_survey_metrics(
+                            &idb,
+                            &function_addresses,
+                            &string_addresses,
+                        ),
+                        SdkMutation::SignatureBytes {
+                            address,
+                            size,
+                            wildcard_operands,
+                        } => definitions::handle_signature_bytes(
+                            &idb,
+                            address,
+                            size,
+                            wildcard_operands,
+                        ),
+                        SdkMutation::SetOperandType {
+                            address,
+                            operand,
+                            kind,
+                            target,
+                            struct_name,
+                            delta,
+                        } => definitions::handle_set_operand_type(
+                            &idb,
+                            address,
+                            operand,
+                            &kind,
+                            target,
+                            struct_name.as_deref(),
+                            delta,
+                        ),
+                        SdkMutation::MakeData {
+                            address,
+                            declaration,
+                            name,
+                            delete_existing,
+                        } => definitions::handle_make_data(
+                            &idb,
+                            address,
+                            &declaration,
+                            name.as_deref(),
+                            delete_existing,
+                        ),
+                    });
+                if let Err(error) = &result {
+                    warn!(error = %error, "SDK mutation failed");
+                }
+                let _ = resp.send(result);
+            }
+            IdaRequest::SetComments {
+                addr,
+                name,
+                offset,
+                comment,
+                repeatable,
+                resp,
+            } => {
+                let addr_log = addr
+                    .map(|a| format!("{a:#x}"))
+                    .unwrap_or_else(|| "none".to_string());
+                debug!(
+                    address = addr_log,
+                    name = ?name,
+                    offset,
+                    repeatable,
+                    "Setting comment"
+                );
+                let result = crate::crash_guard::crash_guarded("handle_set_comments", || {
+                    annotations::handle_set_comments(
+                        &idb,
+                        addr,
+                        name.as_deref(),
+                        offset,
+                        &comment,
+                        repeatable,
+                    )
+                });
+                if let Err(e) = &result {
+                    warn!(error = %e, "Failed to set comment");
+                }
+                let _ = resp.send(result);
+            }
+            IdaRequest::AppendComment {
+                addr,
+                comment,
+                scope,
+                dedupe,
+                resp,
+            } => {
+                debug!(address = format!("{addr:#x}"), scope, "Appending comment");
+                let result = crate::crash_guard::crash_guarded("handle_append_comment", || {
+                    annotations::handle_append_comment(&idb, addr, &comment, &scope, dedupe)
+                });
+                if let Err(error) = &result {
+                    warn!(error = %error, "Failed to append comment");
+                }
+                let _ = resp.send(result);
+            }
+            IdaRequest::Rename {
+                addr,
+                current_name,
+                new_name,
+                flags,
+                resp,
+            } => {
+                let addr_log = addr
+                    .map(|a| format!("{a:#x}"))
+                    .unwrap_or_else(|| "none".to_string());
+                debug!(
+                    address = addr_log,
+                    current_name = ?current_name,
+                    flags,
+                    "Renaming symbol"
+                );
+                let result = crate::crash_guard::crash_guarded("handle_rename", || {
+                    annotations::handle_rename(
+                        &idb,
+                        addr,
+                        current_name.as_deref(),
+                        &new_name,
+                        flags,
+                    )
+                });
+                if let Err(e) = &result {
+                    warn!(error = %e, "Failed to rename");
+                }
+                let _ = resp.send(result);
+            }
+            IdaRequest::PatchBytes {
+                addr,
+                name,
+                offset,
+                bytes,
+                resp,
+            } => {
+                let addr_log = addr
+                    .map(|a| format!("{a:#x}"))
+                    .unwrap_or_else(|| "none".to_string());
+                debug!(
+                    address = addr_log,
+                    name = ?name,
+                    offset,
+                    length = bytes.len(),
+                    "Patching bytes"
+                );
+                let result = crate::crash_guard::crash_guarded("handle_patch_bytes", || {
+                    memory::handle_patch_bytes(&idb, addr, name.as_deref(), offset, &bytes)
+                });
+                if let Err(e) = &result {
+                    warn!(error = %e, "Failed to patch bytes");
+                }
+                let _ = resp.send(result);
+            }
+            IdaRequest::PatchAsm {
+                addr,
+                name,
+                offset,
+                line,
+                resp,
+            } => {
+                let addr_log = addr
+                    .map(|a| format!("{a:#x}"))
+                    .unwrap_or_else(|| "none".to_string());
+                debug!(
+                    address = addr_log,
+                    name = ?name,
+                    offset,
+                    line = %line,
+                    "Patching asm"
+                );
+                let result = crate::crash_guard::crash_guarded("handle_patch_asm", || {
+                    memory::handle_patch_asm(&idb, addr, name.as_deref(), offset, &line)
+                });
+                if let Err(e) = &result {
+                    warn!(error = %e, "Failed to patch asm");
+                }
+                let _ = resp.send(result);
+            }
+            IdaRequest::BasicBlocks { addr, resp } => {
+                debug!(address = format!("{:#x}", addr), "Getting basic blocks");
+                let result = crate::crash_guard::crash_guarded("handle_basic_blocks", || {
+                    controlflow::handle_basic_blocks(&idb, addr)
+                });
+                match &result {
+                    Ok(bbs) => debug!(count = bbs.len(), "Got basic blocks"),
+                    Err(e) => warn!(error = %e, "Failed to get basic blocks"),
+                }
+                let _ = resp.send(result);
+            }
+            IdaRequest::Callees { addr, resp } => {
+                debug!(address = format!("{:#x}", addr), "Getting callees");
+                let result = crate::crash_guard::crash_guarded("handle_callees", || {
+                    controlflow::handle_callees(&idb, addr)
+                });
+                match &result {
+                    Ok(funcs) => debug!(count = funcs.len(), "Got callees"),
+                    Err(e) => warn!(error = %e, "Failed to get callees"),
+                }
+                let _ = resp.send(result);
+            }
+            IdaRequest::Callers { addr, resp } => {
+                debug!(address = format!("{:#x}", addr), "Getting callers");
+                let result = crate::crash_guard::crash_guarded("handle_callers", || {
+                    controlflow::handle_callers(&idb, addr)
+                });
+                match &result {
+                    Ok(funcs) => debug!(count = funcs.len(), "Got callers"),
+                    Err(e) => warn!(error = %e, "Failed to get callers"),
+                }
+                let _ = resp.send(result);
+            }
+            IdaRequest::IdbMeta { resp } => {
+                debug!("Getting IDB metadata");
+                let result = crate::crash_guard::crash_guarded("handle_idb_meta", || {
+                    globals::handle_idb_meta(&idb)
+                });
+                let _ = resp.send(result);
+            }
+            IdaRequest::LookupFunctions { queries, resp } => {
+                debug!(count = queries.len(), "Looking up functions");
+                let result = crate::crash_guard::crash_guarded("handle_lookup_funcs", || {
+                    functions::handle_lookup_funcs(&idb, &queries)
+                });
+                let _ = resp.send(result);
+            }
+            IdaRequest::ListGlobals { query, resp } => {
+                debug!(
+                    offset = query.offset,
+                    limit = query.limit,
+                    filter = ?query.filter,
+                    "Listing globals"
+                );
+                let result = crate::crash_guard::crash_guarded("handle_list_globals", || {
+                    globals::handle_list_globals(&idb, &query)
+                });
+                let _ = resp.send(result);
+            }
+            IdaRequest::AnalyzeStrings { query, resp } => {
+                debug!(
+                    offset = query.offset,
+                    limit = query.limit,
+                    filter = ?query.filter,
+                    "Analyzing strings"
+                );
+                let result = crate::crash_guard::crash_guarded("handle_analyze_strings", || {
+                    strings::handle_analyze_strings(&idb, &query)
+                });
+                let _ = resp.send(result);
+            }
+            IdaRequest::FindString { search, resp } => {
+                debug!(
+                    query = %search.query,
+                    exact = search.exact,
+                    case_insensitive = search.case_insensitive,
+                    regex = search.regex,
+                    offset = search.offset,
+                    limit = search.limit,
+                    "Finding strings"
+                );
+                let result = crate::crash_guard::crash_guarded("handle_find_string", || {
+                    strings::handle_find_string(&idb, &search)
+                });
+                let _ = resp.send(result);
+            }
+            IdaRequest::XrefsToString {
+                search,
+                max_xrefs,
+                resp,
+            } => {
+                debug!(
+                    query = %search.query,
+                    exact = search.exact,
+                    case_insensitive = search.case_insensitive,
+                    regex = search.regex,
+                    offset = search.offset,
+                    limit = search.limit,
+                    max_xrefs,
+                    "Getting xrefs to strings"
+                );
+                let result = crate::crash_guard::crash_guarded("handle_xrefs_to_string", || {
+                    strings::handle_xrefs_to_string(&idb, &search, max_xrefs)
+                });
+                let _ = resp.send(result);
+            }
+            IdaRequest::AnalyzeFuncs {
+                progress_tx,
+                cancel,
+                resp,
+            } => {
+                if let Err(err) = ensure_not_cancelled(cancel.as_ref()) {
+                    emit_progress(
+                        progress_tx.as_ref(),
+                        "cancelled",
+                        0.0,
+                        Some(SINGLE_PHASE_PROGRESS_TOTAL),
+                        "analyze_funcs cancelled before starting auto-analysis",
+                    );
+                    let _ = resp.send(Err(err));
+                    continue;
+                }
+                debug!("Running auto-analysis");
+                let result = crate::crash_guard::crash_guarded("handle_analyze_funcs", || {
+                    functions::handle_analyze_funcs(&mut idb, progress_tx.clone(), cancel.clone())
+                });
+                match &result {
+                    Ok(value) => emit_progress(
+                        progress_tx.as_ref(),
+                        "completed",
+                        SINGLE_PHASE_PROGRESS_TOTAL,
+                        Some(SINGLE_PHASE_PROGRESS_TOTAL),
+                        format!(
+                            "Auto-analysis completed (completed={}, functions={})",
+                            value
+                                .get("completed")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false),
+                            value
+                                .get("function_count")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0)
+                        ),
+                    ),
+                    Err(ToolError::Cancelled(message)) => emit_progress(
+                        progress_tx.as_ref(),
+                        "cancelled",
+                        0.0,
+                        Some(SINGLE_PHASE_PROGRESS_TOTAL),
+                        message.clone(),
+                    ),
+                    Err(err) => emit_progress(
+                        progress_tx.as_ref(),
+                        "failed",
+                        0.0,
+                        Some(SINGLE_PHASE_PROGRESS_TOTAL),
+                        format!("analyze_funcs failed: {err}"),
+                    ),
+                }
+                let _ = resp.send(result);
+            }
+            IdaRequest::FindBytes {
+                pattern,
+                max_results,
+                resp,
+            } => {
+                debug!(pattern = %pattern, max_results, "Finding bytes");
+                let result = crate::crash_guard::crash_guarded("handle_find_bytes", || {
+                    search::handle_find_bytes(&idb, &pattern, max_results)
+                });
+                let _ = resp.send(result);
+            }
+            IdaRequest::SearchText {
+                text,
+                max_results,
+                scope,
+                code_only,
+                resp,
+            } => {
+                debug!(text = %text, max_results, scope = ?scope, "Searching text");
+                let result = crate::crash_guard::crash_guarded("handle_search_text", || {
+                    search::handle_search_text(&idb, &text, max_results, &scope, code_only)
+                });
+                let _ = resp.send(result);
+            }
+            IdaRequest::SearchImm {
+                imm,
+                max_results,
+                scope,
+                code_only,
+                resp,
+            } => {
+                debug!(imm, max_results, scope = ?scope, "Searching immediate");
+                let result = crate::crash_guard::crash_guarded("handle_search_imm", || {
+                    search::handle_search_imm(&idb, imm, max_results, &scope, code_only)
+                });
+                let _ = resp.send(result);
+            }
+            IdaRequest::FindInsns { scan, resp } => {
+                debug!(
+                    patterns = ?scan.patterns,
+                    scope = ?scan.scope,
+                    max_results = scan.max_results,
+                    "Finding instruction sequences"
+                );
+                let result = crate::crash_guard::crash_guarded("handle_find_insns", || {
+                    search::handle_find_insns(&idb, &scan)
+                });
+                let _ = resp.send(result);
+            }
+            IdaRequest::FindInsnOperands { scan, resp } => {
+                debug!(
+                    patterns = ?scan.patterns,
+                    scope = ?scan.scope,
+                    max_results = scan.max_results,
+                    "Finding instruction operands"
+                );
+                let result = crate::crash_guard::crash_guarded("handle_find_insn_operands", || {
+                    search::handle_find_insn_operands(&idb, &scan)
+                });
+                let _ = resp.send(result);
+            }
+            IdaRequest::MakeSignature { request, resp } => {
+                debug!(
+                    address = format!("{:#x}", request.address),
+                    max_length = request.max_length,
+                    "Making signature"
+                );
+                let result = crate::crash_guard::crash_guarded("handle_make_signature", || {
+                    signature::handle_make_signature(&idb, &request)
+                });
+                let _ = resp.send(result);
+            }
+            IdaRequest::ReadInt { addr, size, resp } => {
+                debug!(address = format!("{:#x}", addr), size, "Reading int");
+                let result = crate::crash_guard::crash_guarded("handle_read_int", || {
+                    memory::handle_read_int(&idb, addr, size)
+                });
+                let _ = resp.send(result);
+            }
+            IdaRequest::GetInt { addr, spec, resp } => {
+                debug!(address = format!("{addr:#x}"), ty = %spec, "Reading typed int");
+                let result = crate::crash_guard::crash_guarded("handle_get_int", || {
+                    memory::handle_get_int(&idb, addr, spec)
+                });
+                let _ = resp.send(result);
+            }
+            IdaRequest::PutInt {
+                addr,
+                spec,
+                value,
+                resp,
+            } => {
+                debug!(address = format!("{addr:#x}"), ty = %spec, value, "Writing typed int");
+                let result = crate::crash_guard::crash_guarded("handle_put_int", || {
+                    memory::handle_put_int(&idb, addr, spec, value)
+                });
+                let _ = resp.send(result);
+            }
+            IdaRequest::GetString {
+                addr,
+                max_len,
+                resp,
+            } => {
+                debug!(address = format!("{:#x}", addr), max_len, "Reading string");
+                let result = crate::crash_guard::crash_guarded("handle_get_string", || {
+                    strings::handle_get_string(&idb, addr, max_len)
+                });
+                let _ = resp.send(result);
+            }
+            IdaRequest::GetGlobalValue { query, resp } => {
+                debug!(query = %query, "Getting global value");
+                let result = crate::crash_guard::crash_guarded("handle_get_global_value", || {
+                    globals::handle_get_global_value(&idb, &query)
+                });
+                let _ = resp.send(result);
+            }
+            IdaRequest::FindPaths {
+                start,
+                end,
+                max_paths,
+                max_depth,
+                resp,
+            } => {
+                debug!(
+                    start = format!("{:#x}", start),
+                    end = format!("{:#x}", end),
+                    max_paths,
+                    max_depth,
+                    "Finding paths"
+                );
+                let result = crate::crash_guard::crash_guarded("handle_find_paths", || {
+                    controlflow::handle_find_paths(&idb, start, end, max_paths, max_depth)
+                });
+                let _ = resp.send(result);
+            }
+            IdaRequest::CallGraph {
+                addr,
+                max_depth,
+                max_nodes,
+                resp,
+            } => {
+                debug!(
+                    address = format!("{:#x}", addr),
+                    max_depth, max_nodes, "Building call graph"
+                );
+                let result = crate::crash_guard::crash_guarded("handle_callgraph", || {
+                    controlflow::handle_callgraph(&idb, addr, max_depth, max_nodes)
+                });
+                let _ = resp.send(result);
+            }
+            IdaRequest::XrefMatrix { addrs, resp } => {
+                debug!(count = addrs.len(), "Building xref matrix");
+                let result = crate::crash_guard::crash_guarded("handle_xref_matrix", || {
+                    xrefs::handle_xref_matrix(&idb, &addrs)
+                });
+                let _ = resp.send(result);
+            }
+            IdaRequest::ExportFuncs {
+                offset,
+                limit,
+                resp,
+            } => {
+                debug!(offset, limit, "Exporting functions");
+                let result = crate::crash_guard::crash_guarded("handle_list_functions", || {
+                    functions::handle_list_functions(&idb, &FunctionQuery::paged(offset, limit))
+                });
+                let _ = resp.send(result);
+            }
+            IdaRequest::PseudocodeAt {
+                addr,
+                end_addr,
+                resp,
+            } => {
+                debug!(
+                    address = format!("{:#x}", addr),
+                    end_addr = end_addr.map(|a| format!("{:#x}", a)),
+                    "Getting pseudocode at address"
+                );
+                let result = crate::crash_guard::crash_guarded("handle_pseudocode_at", || {
+                    disasm::handle_pseudocode_at(&idb, addr, end_addr)
+                });
+                match &result {
+                    Ok(v) => debug!(
+                        count = v
+                            .get("statements")
+                            .and_then(|s| s.as_array())
+                            .map(|a| a.len())
+                            .unwrap_or(0),
+                        "Got pseudocode at address"
+                    ),
+                    Err(e) => {
+                        warn!(address = format!("{:#x}", addr), error = %e, "Failed to get pseudocode")
+                    }
+                }
+                let _ = resp.send(result);
+            }
+            IdaRequest::RunScript {
+                code,
+                progress_tx,
+                cancel,
+                resp,
+            } => {
+                if let Err(err) = ensure_not_cancelled(cancel.as_ref()) {
+                    emit_progress(
+                        progress_tx.as_ref(),
+                        "cancelled",
+                        0.0,
+                        Some(SINGLE_PHASE_PROGRESS_TOTAL),
+                        "run_script cancelled before execution started",
+                    );
+                    let _ = resp.send(Err(err));
+                    continue;
+                }
+                debug!(code_len = code.len(), "Running script");
+                let started = std::time::Instant::now();
+                let result = crate::crash_guard::crash_guarded("handle_run_script", || {
+                    script::handle_run_script(&idb, &code, progress_tx.clone(), cancel.clone())
+                });
+                let elapsed_ms = started.elapsed().as_millis();
+                match &result {
+                    Ok(value) => {
+                        let success = value.get("success").and_then(|v| v.as_bool()) == Some(true);
+                        let stdout_len = value
+                            .get("stdout")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.len())
+                            .unwrap_or(0);
+                        let stderr_len = value
+                            .get("stderr")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.len())
+                            .unwrap_or(0);
+                        if success {
+                            emit_progress(
+                                progress_tx.as_ref(),
+                                "completed",
+                                SINGLE_PHASE_PROGRESS_TOTAL,
+                                Some(SINGLE_PHASE_PROGRESS_TOTAL),
+                                format!("Script executed successfully in {elapsed_ms}ms"),
+                            );
+                            debug!(elapsed_ms, stdout_len, stderr_len, "Script executed");
+                        } else {
+                            let error = value.get("error").and_then(|v| v.as_str()).unwrap_or("");
+                            emit_progress(
+                                progress_tx.as_ref(),
+                                "failed",
+                                0.0,
+                                Some(SINGLE_PHASE_PROGRESS_TOTAL),
+                                format!("Script execution reported failure: {error}"),
+                            );
+                            warn!(
+                                elapsed_ms,
+                                stdout_len, stderr_len, error, "Script execution reported failure"
+                            );
+                        }
+                    }
+                    Err(ToolError::Cancelled(message)) => {
+                        emit_progress(
+                            progress_tx.as_ref(),
+                            "cancelled",
+                            0.0,
+                            Some(SINGLE_PHASE_PROGRESS_TOTAL),
+                            message.clone(),
+                        );
+                        warn!(elapsed_ms, error = %message, "Script execution cancelled");
+                    }
+                    Err(e) => {
+                        emit_progress(
+                            progress_tx.as_ref(),
+                            "failed",
+                            0.0,
+                            Some(SINGLE_PHASE_PROGRESS_TOTAL),
+                            format!("Failed to execute script: {e}"),
+                        );
+                        warn!(elapsed_ms, error = %e, "Failed to execute script");
+                    }
+                }
+                let _ = resp.send(result);
+            }
+            IdaRequest::Shutdown => {
+                info!("Worker shutting down");
+                shutdown_cleanup(&mut idb, &mut lock_file, &mut lock_path);
+                break;
+            }
+        }
+    }
+}
+
+fn shutdown_cleanup(
+    idb: &mut Option<IDB>,
+    lock_file: &mut Option<File>,
+    lock_path: &mut Option<PathBuf>,
+) {
+    // Explicitly close database to ensure IDA packs it before exit.
+    if idb.take().is_some() {
+        info!("Closing database before shutdown");
+    }
+    release_mcp_lock(lock_file, lock_path);
+}
+
+/// Send a version-mismatch error for every request variant so the
+/// agent gets a clear message instead of a segfault.
+/// Refuse an operation whose caller opened a database that is no longer the
+/// current one. `None` opts out (foreground tools legitimately target whatever
+/// database is open); `Some` binds the operation to one database lifetime.
+///
+/// This must be evaluated in the same loop iteration that performs the work:
+/// the worker dequeues serially, so an "assert generation" request followed by
+/// a separate operation request would let a close/reopen slip between them.
+fn require_generation(
+    expected: Option<DatabaseGeneration>,
+    current: Option<DatabaseGeneration>,
+) -> Result<(), ToolError> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    if current == Some(expected) {
+        return Ok(());
+    }
+    warn!(
+        expected_generation = expected.0,
+        current_generation = current.map(|generation| generation.0),
+        "Refusing an operation bound to a replaced database generation"
+    );
+    Err(ToolError::DatabaseReplaced)
+}
+
+fn reject_with_version_error(req: IdaRequest, msg: &str) {
+    reject_with_error(req, ToolError::SdkVersionMismatch(msg.to_owned()));
+}
+
+fn reject_with_error(req: IdaRequest, err: ToolError) {
+    /// Helper: send `Err(err)` on a `oneshot::Sender<Result<T, ToolError>>`.
+    macro_rules! reject {
+        ($resp:expr, $err:expr) => {{
+            let _ = $resp.send(Err($err));
+        }};
+    }
+
+    match req {
+        IdaRequest::Shutdown => {} // always honour shutdown
+        IdaRequest::Close { resp, .. } => {
+            let _ = resp.send(());
+        }
+        IdaRequest::CloseIfGeneration { resp, .. } => reject!(resp, err),
+        IdaRequest::Open { resp, .. } => reject!(resp, err),
+        IdaRequest::Warmup { resp, .. } => reject!(resp, err),
+        IdaRequest::LoadDebugInfo { resp, .. } => reject!(resp, err),
+        IdaRequest::AnalysisStatus { resp, .. } => reject!(resp, err),
+        IdaRequest::DscLoadImage { resp, .. } => reject!(resp, err),
+        IdaRequest::DscLoadRegion { resp, .. } => reject!(resp, err),
+        IdaRequest::ListFunctions { resp, .. } => reject!(resp, err),
+        IdaRequest::ResolveFunction { resp, .. } => reject!(resp, err),
+        IdaRequest::DisasmByName { resp, .. } => reject!(resp, err),
+        IdaRequest::Disasm { resp, .. } => reject!(resp, err),
+        IdaRequest::Decompile { resp, .. } => reject!(resp, err),
+        IdaRequest::Segments { resp, .. } => reject!(resp, err),
+        IdaRequest::Strings { resp, .. } => reject!(resp, err),
+        IdaRequest::LocalTypes { resp, .. } => reject!(resp, err),
+        IdaRequest::DeclareType { resp, .. } => reject!(resp, err),
+        IdaRequest::ApplyTypes { resp, .. } => reject!(resp, err),
+        IdaRequest::InferTypes { resp, .. } => reject!(resp, err),
+        IdaRequest::AddrInfo { resp, .. } => reject!(resp, err),
+        IdaRequest::FunctionAt { resp, .. } => reject!(resp, err),
+        IdaRequest::DisasmFunctionAt { resp, .. } => reject!(resp, err),
+        IdaRequest::DeclareStack { resp, .. } => reject!(resp, err),
+        IdaRequest::DeleteStack { resp, .. } => reject!(resp, err),
+        IdaRequest::StackFrame { resp, .. } => reject!(resp, err),
+        IdaRequest::Structs { resp, .. } => reject!(resp, err),
+        IdaRequest::StructInfo { resp, .. } => reject!(resp, err),
+        IdaRequest::ReadStruct { resp, .. } => reject!(resp, err),
+        IdaRequest::XRefsTo { resp, .. } => reject!(resp, err),
+        IdaRequest::XRefsFrom { resp, .. } => reject!(resp, err),
+        IdaRequest::XRefsToField { resp, .. } => reject!(resp, err),
+        IdaRequest::Imports { resp, .. } => reject!(resp, err),
+        IdaRequest::Exports { resp, .. } => reject!(resp, err),
+        IdaRequest::Entrypoints { resp, .. } => reject!(resp, err),
+        IdaRequest::LuminaLookup { resp, .. } => reject!(resp, err),
+        IdaRequest::LuminaApply { resp, .. } => reject!(resp, err),
+        IdaRequest::GetBytes { resp, .. } => reject!(resp, err),
+        IdaRequest::AddBookmark { resp, .. } => reject!(resp, err),
+        IdaRequest::SdkMutation { resp, .. } => reject!(resp, err),
+        IdaRequest::SetComments { resp, .. } => reject!(resp, err),
+        IdaRequest::AppendComment { resp, .. } => reject!(resp, err),
+        IdaRequest::Rename { resp, .. } => reject!(resp, err),
+        IdaRequest::PatchBytes { resp, .. } => reject!(resp, err),
+        IdaRequest::PatchAsm { resp, .. } => reject!(resp, err),
+        IdaRequest::BasicBlocks { resp, .. } => reject!(resp, err),
+        IdaRequest::Callees { resp, .. } => reject!(resp, err),
+        IdaRequest::Callers { resp, .. } => reject!(resp, err),
+        IdaRequest::IdbMeta { resp, .. } => reject!(resp, err),
+        IdaRequest::LookupFunctions { resp, .. } => reject!(resp, err),
+        IdaRequest::ListGlobals { resp, .. } => reject!(resp, err),
+        IdaRequest::AnalyzeStrings { resp, .. } => reject!(resp, err),
+        IdaRequest::FindString { resp, .. } => reject!(resp, err),
+        IdaRequest::XrefsToString { resp, .. } => reject!(resp, err),
+        IdaRequest::AnalyzeFuncs { resp, .. } => reject!(resp, err),
+        IdaRequest::FindBytes { resp, .. } => reject!(resp, err),
+        IdaRequest::SearchText { resp, .. } => reject!(resp, err),
+        IdaRequest::SearchImm { resp, .. } => reject!(resp, err),
+        IdaRequest::FindInsns { resp, .. } => reject!(resp, err),
+        IdaRequest::FindInsnOperands { resp, .. } => reject!(resp, err),
+        IdaRequest::MakeSignature { resp, .. } => reject!(resp, err),
+        IdaRequest::ReadInt { resp, .. } => reject!(resp, err),
+        IdaRequest::GetInt { resp, .. } => reject!(resp, err),
+        IdaRequest::PutInt { resp, .. } => reject!(resp, err),
+        IdaRequest::GetString { resp, .. } => reject!(resp, err),
+        IdaRequest::GetGlobalValue { resp, .. } => reject!(resp, err),
+        IdaRequest::FindPaths { resp, .. } => reject!(resp, err),
+        IdaRequest::CallGraph { resp, .. } => reject!(resp, err),
+        IdaRequest::XrefMatrix { resp, .. } => reject!(resp, err),
+        IdaRequest::ExportFuncs { resp, .. } => reject!(resp, err),
+        IdaRequest::PseudocodeAt { resp, .. } => reject!(resp, err),
+        IdaRequest::RunScript { resp, .. } => reject!(resp, err),
+    }
+}
+
+/// Compare the compile-time SDK version against the runtime version.
+/// Returns an error message on mismatch, `None` if they match.
+///
+/// The minor version has to match once **either side** reaches 9.4, not just
+/// the SDK. `idalib` reconstructs IDA-internal layouts by hand — the
+/// `license_manager_t` vtable most visibly, where 9.4 inserted one more virtual
+/// method ahead of `check()`. A binary built against an older SDK then calls
+/// through the wrong slot and the process dies with no diagnosis at all — as
+/// fatal as a major-version mismatch, and gating on `sdk_version` alone lets it
+/// through.
+///
+/// Below 9.4 the minor stays out of it, and not for symmetry: IDA 9.3 reports
+/// its product version as 9.0 (see
+/// [`tests::product_minor_zero_does_not_mismatch_sdk_minor_three`]), so
+/// comparing minors there rejects a runtime that is in fact correct.
+fn check_version_mismatch(sdk_version: (i32, i32), runtime_version: (i32, i32)) -> Option<String> {
+    let (sdk_major, sdk_minor) = sdk_version;
+    let (runtime_major, runtime_minor) = runtime_version;
+    let major_mismatch = runtime_major != sdk_major;
+    let exact_minor_required = sdk_version >= (9, 4) || runtime_version >= (9, 4);
+    let minor_mismatch = exact_minor_required && runtime_minor != sdk_minor;
+
+    if major_mismatch || minor_mismatch {
+        Some(format!(
+            "IDA version mismatch: ida-mcp was compiled for IDA \
+             {sdk_major}.{sdk_minor}, but the runtime IDA library reports \
+             {runtime_major}.{runtime_minor}. Install the matching IDA \
+             version or use the ida-mcp release built for your IDA version.",
+        ))
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsStr;
+    use std::path::{Path, PathBuf};
+
+    use crate::error::ToolError;
+    use crate::ida::main_loop::{
+        check_version_mismatch, configure_lumina, first_ida_user_dir, require_generation,
+        should_check_license_expiry, should_isolate_idausr,
+    };
+    use crate::ida::types::DatabaseGeneration;
+
+    #[test]
+    fn unbound_operations_target_whatever_database_is_open() {
+        // Foreground tools legitimately act on the current database.
+        assert!(require_generation(None, Some(DatabaseGeneration(7))).is_ok());
+        assert!(require_generation(None, None).is_ok());
+    }
+
+    #[test]
+    fn bound_operation_runs_against_the_database_it_opened() {
+        assert!(
+            require_generation(Some(DatabaseGeneration(7)), Some(DatabaseGeneration(7))).is_ok()
+        );
+    }
+
+    /// The close/reopen race: a background task opened generation N, another
+    /// request closed it and opened N+1, and the task's remaining work must be
+    /// refused instead of silently redirected onto the new database.
+    #[test]
+    fn bound_operation_is_refused_after_a_close_and_reopen() {
+        let err = require_generation(Some(DatabaseGeneration(1)), Some(DatabaseGeneration(2)))
+            .expect_err("a replaced database must refuse the stale operation");
+        assert!(matches!(err, ToolError::DatabaseReplaced), "{err}");
+    }
+
+    #[test]
+    fn bound_operation_is_refused_after_a_plain_close() {
+        let err = require_generation(Some(DatabaseGeneration(1)), None)
+            .expect_err("a closed database must refuse the stale operation");
+        assert!(matches!(err, ToolError::DatabaseReplaced), "{err}");
+    }
+
+    #[test]
+    fn matching_ida_94_version_passes() {
+        assert!(check_version_mismatch((9, 4), (9, 4)).is_none());
+    }
+
+    #[test]
+    fn mismatched_major_version_returns_error() {
+        let msg = check_version_mismatch((9, 4), (8, 4))
+            .expect("mismatched major version should return an error");
+        assert!(msg.contains("compiled for IDA 9.4"), "{msg}");
+        assert!(msg.contains("reports 8.4"), "{msg}");
+    }
+
+    #[test]
+    fn ida_94_rejects_mismatched_minor_version() {
+        let msg = check_version_mismatch((9, 4), (9, 3))
+            .expect("IDA 9.4 should reject a mismatched minor version");
+        assert!(msg.contains("reports 9.3"));
+    }
+
+    /// The direction that slips through without this check, and it is the
+    /// common one: an older build picked up on a machine that has since
+    /// upgraded IDA. Measured
+    /// on 9.4.260714 — the SDK 9.2 binary dumped core inside IDA's own init,
+    /// with nothing in the log between the version line and the signal. This
+    /// check is the difference between that and a sentence naming the problem.
+    #[test]
+    fn an_older_build_is_rejected_by_a_94_runtime() {
+        let msg = check_version_mismatch((9, 2), (9, 4))
+            .expect("an SDK 9.2 build must not proceed against an IDA 9.4 runtime");
+        assert!(msg.contains("compiled for IDA 9.2"), "{msg}");
+        assert!(msg.contains("reports 9.4"), "{msg}");
+    }
+
+    /// IDA 9.3 returns product version 9.0.260213 — the minor=0 must
+    /// NOT trigger a mismatch when SDK_VERSION is (9, 3). Issue #9.
+    #[test]
+    fn product_minor_zero_does_not_mismatch_sdk_minor_three() {
+        // sdk_major=9 (from SDK_VERSION=(9,3)), runtime major=9
+        // (from get_library_version returning 9.0.260213).
+        // The minor versions differ (3 vs 0) but we only compare major.
+        assert!(check_version_mismatch((9, 3), (9, 0)).is_none());
+    }
+
+    #[test]
+    fn license_expiry_preflight_kept_before_ida_94() {
+        assert!(should_check_license_expiry((9, 3)));
+    }
+
+    #[test]
+    fn all_supported_sdk_versions_isolate_the_ida_profile() {
+        assert!(should_isolate_idausr((9, 2)));
+        assert!(should_isolate_idausr((9, 3)));
+        assert!(should_isolate_idausr((9, 4)));
+    }
+
+    #[test]
+    fn license_expiry_preflight_skipped_for_ida_94() {
+        assert!(!should_check_license_expiry((9, 4)));
+    }
+
+    #[test]
+    fn empty_idausr_does_not_select_the_current_directory() {
+        assert_eq!(first_ida_user_dir(OsStr::new("")), (None, false));
+    }
+
+    #[test]
+    fn multi_path_idausr_selects_only_the_first_directory() {
+        let raw = std::env::join_paths([Path::new("/first"), Path::new("/second")])
+            .expect("test paths should form a valid IDAUSR");
+        assert_eq!(
+            first_ida_user_dir(&raw),
+            (Some(PathBuf::from("/first")), true)
+        );
+    }
+
+    #[test]
+    fn lumina_configuration_refuses_a_shared_profile() {
+        let err = configure_lumina(false, false)
+            .expect_err("default Lumina configuration must fail closed without isolation");
+        assert!(err.contains("shared IDA profile"));
+    }
+}

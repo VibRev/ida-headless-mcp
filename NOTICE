@@ -1,0 +1,23 @@
+ida-headless-mcp
+Copyright (c) 2026 fuqiuluo and ida-headless-mcp contributors
+Licensed under the MIT License.
+
+This project contains substantial portions derived from ida-mcp-rs:
+https://github.com/blacktop/ida-mcp-rs
+Copyright (c) 2026 blacktop
+Licensed under the MIT License.
+
+Compatibility behavior, schemas, and test fixtures are based on ida-pro-mcp:
+https://github.com/mrexodia/ida-pro-mcp
+Copyright (c) Duncan Ogilvie and contributors
+Licensed under the MIT License.
+
+skills/idapython/ is copied verbatim from that same project. The IDAPython API
+reference it summarizes documents interfaces owned by Hex-Rays SA.
+
+The idalib Rust bindings are provided by their respective authors under
+MIT OR Apache-2.0 terms as declared by the idalib packages.
+
+IDA Pro, the IDA SDK, Hex-Rays, and related names are property of Hex-Rays SA.
+This project does not distribute IDA Pro, its SDK, or its runtime libraries.
+This project is not affiliated with or endorsed by Hex-Rays SA.

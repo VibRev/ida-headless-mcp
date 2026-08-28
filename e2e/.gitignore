@@ -1,0 +1,5 @@
+# Fixtures
+fixtures/*
+!fixtures/
+!fixtures/*.c
+!fixtures/*.py
