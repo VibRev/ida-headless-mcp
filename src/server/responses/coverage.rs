@@ -4,6 +4,12 @@ use crate::ida::types as worker;
 use rmcp::schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+/// Whether this database's analysis has settled.
+///
+/// Read `auto_is_ok` and nothing else. The other three fields are IDA's own
+/// bookkeeping and read as contradictory when taken as readiness signals, which
+/// is what they look like: a freshly opened shared cache reports
+/// `analysis_running: true` beside `auto_state: AU_NONE`, and both are correct.
 ///
 /// `session_id` is added by the supervisor-facing worker before the value
 /// leaves the process and stripped again on the way back out, so it is present
@@ -13,13 +19,21 @@ use serde::{Deserialize, Serialize};
 pub struct AnalysisStatusOutput {
     /// True when IDA's auto-analysis is enabled for this database.
     pub auto_enabled: bool,
-    /// True when analysis has settled: xrefs and decompilation are reliable.
+    /// The readiness signal. True when analysis has settled, so xrefs,
+    /// decompilation and every count are the database's final answer; false
+    /// means run analyze_funcs and read again. This is the only field to branch
+    /// on.
     pub auto_is_ok: bool,
-    /// Human-readable analysis state name.
+    /// IDA's `AU_*` state name, for diagnostics only — not a readiness signal.
+    /// It is not monotonic and does not converge: a fully analyzed binary
+    /// reports `AU_NONE`, the same value it reports the instant it is opened.
+    /// Never conclude "analysis is done" from it.
     pub auto_state: String,
-    /// Numeric analysis state as IDA reports it.
+    /// Numeric form of `auto_state`, with the same caveat.
     pub auto_state_id: i32,
-    /// True while a analysis pass is still running.
+    /// True while an analysis pass is in flight. Distinguishes "wait and
+    /// re-read" from "analysis will not finish on its own, call analyze_funcs".
+    /// Independent of `auto_state`, which may read `AU_NONE` throughout.
     pub analysis_running: bool,
     /// Worker session that answered; absent on the supervisor's face.
     #[serde(default, skip_serializing_if = "Option::is_none")]

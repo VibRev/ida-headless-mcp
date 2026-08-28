@@ -57,6 +57,10 @@ test-session-cancel: build
 test-http-startup: build
     cd e2e && SERVER_BIN=../target/debug/ida-headless-mcp just test-http-startup
 
+# Run the IDA install-mismatch gate test (no IDA license or fixture required)
+test-install-mismatch: build
+    cd e2e && SERVER_BIN=../target/debug/ida-headless-mcp just test-install-mismatch
+
 # Run HTTP worker-pool concurrency test (debug)
 test-pool: build
     cd e2e && SERVER_BIN=../target/debug/ida-headless-mcp RUST_LOG=ida_mcp=trace just test-pool

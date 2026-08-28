@@ -5,6 +5,8 @@
 //! (IDA types are not thread-safe).
 
 pub mod handlers;
+pub mod hexrays;
+pub mod install;
 pub mod int_spec;
 pub(crate) mod leftover;
 pub mod lock;
@@ -25,7 +27,7 @@ pub mod signature;
 pub mod types;
 pub mod worker;
 
-pub use main_loop::{init_ida_library, run_ida_loop, IdaInitState};
+pub use main_loop::{init_ida_library, run_ida_loop, IdaInitState, IdaRuntimePolicy};
 pub use request::IdaRequest;
 pub use types::*;
 pub use worker::IdaWorker;

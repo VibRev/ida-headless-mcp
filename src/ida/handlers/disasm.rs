@@ -2,6 +2,7 @@
 
 use crate::disasm::generate_disasm_line;
 use crate::error::ToolError;
+use crate::ida::hexrays::HexraysDiagnostics;
 use idalib::{Address, IDB};
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -108,7 +109,7 @@ pub fn handle_decompile(idb: &Option<IDB>, addr: u64) -> Result<String, ToolErro
     let db = idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
 
     if !db.decompiler_available() {
-        return Err(ToolError::DecompilerUnavailable);
+        return Err(HexraysDiagnostics::collect(db).into_error());
     }
 
     let func = db
@@ -132,7 +133,7 @@ pub fn handle_pseudocode_at(
 
     // Check if decompiler is available
     if !db.decompiler_available() {
-        return Err(ToolError::DecompilerUnavailable);
+        return Err(HexraysDiagnostics::collect(db).into_error());
     }
 
     // Find the function at this address

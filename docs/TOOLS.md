@@ -23,7 +23,7 @@ Database open/close, analysis status, and discovery tools
 
 | Tool | Title | Supervisor | Output schema | Description |
 |------|-------|------------|---------------|-------------|
-| `analysis_status` | Auto-analysis readiness | routed | yes | Report auto-analysis status (auto_is_ok, auto_state). |
+| `analysis_status` | Auto-analysis readiness | routed | yes | Report auto-analysis readiness. |
 | `analyze_funcs` | Run full auto-analysis | routed | yes | Run IDA auto-analysis to completion. |
 | `close_idb` | Release the open database | worker-local | yes | Close the currently open IDA database. |
 | `dsc_add_dylib` | Map a dylib out of the shared cache | routed | yes | Load an additional dylib into an open DSC database (requires prior open_dsc). |

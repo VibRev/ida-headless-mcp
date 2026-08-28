@@ -16,6 +16,7 @@ unsafe extern "C" {
     ) -> bool;
     fn ida_mcp_mark_cfunc_dirty(address: u64) -> bool;
     fn ida_mcp_init_hexrays() -> bool;
+    fn ida_mcp_idadir(buffer: *mut libc::c_char, buffer_size: usize) -> bool;
     fn ida_mcp_enum_upsert_member(
         enum_name: *const libc::c_char,
         member_name: *const libc::c_char,
@@ -99,6 +100,20 @@ pub fn mark_cfunc_dirty(address: u64) -> bool {
 
 pub fn init_hexrays() -> bool {
     unsafe { ida_mcp_init_hexrays() }
+}
+
+/// The directory IDA loads plugins, processor modules and loaders from.
+///
+/// Only meaningful after `init_library()`; before that IDA has not resolved it
+/// and this returns `None`. [`crate::ida::install`] reads `$IDADIR` instead for
+/// its pre-init check.
+pub fn idadir() -> Option<std::path::PathBuf> {
+    let mut buffer = vec![0u8; 4096];
+    if !unsafe { ida_mcp_idadir(buffer.as_mut_ptr().cast::<libc::c_char>(), buffer.len()) } {
+        return None;
+    }
+    let nul = buffer.iter().position(|byte| *byte == 0)?;
+    crate::ida::install::path_from_bytes(&buffer[..nul])
 }
 
 #[derive(Debug, Clone, Copy)]

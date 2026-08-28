@@ -16,6 +16,7 @@ use crate::ida::handlers::{
     globals, imports, lumina, memory, script, search, segments, signature, strings, structs, types,
     warmup, xrefs,
 };
+use crate::ida::install;
 use crate::ida::lock::release_mcp_lock;
 use crate::ida::observability::{
     emit_progress, ensure_not_cancelled, ProgressHeartbeat, OPEN_IDB_PROGRESS_TOTAL,
@@ -44,21 +45,42 @@ macro_rules! log_result {
     };
 }
 
+/// What this process is allowed to do with the IDA it found.
+///
+/// One value rather than two `bool` parameters threaded side by side: both are
+/// carried unchanged from the command line down to the worker loop, and
+/// `init_ida_library(false, true)` at a call site says nothing about which
+/// decision is which.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct IdaRuntimePolicy {
+    /// Let IDA contact its configured Lumina servers.
+    pub allow_lumina: bool,
+    /// Start even when IDA's core library and its resource tree came from
+    /// different installations. See [`install`].
+    pub allow_mismatch: bool,
+}
+
 pub struct IdaInitState {
     pub library_initialized: bool,
-    pub version_mismatch: Option<String>,
-    allow_lumina: bool,
+    /// Why this process must not touch a database, if it must not.
+    ///
+    /// Was `version_mismatch`, and is no longer only that: a runtime of the
+    /// right version can still be paired with another install's plugins, which
+    /// is the fault that produced misleading Hex-Rays and loader errors for
+    /// long enough to be worth naming honestly. See [`install`].
+    pub install_fault: Option<String>,
+    policy: IdaRuntimePolicy,
     isolated_idausr: Option<IsolatedIdaUserDir>,
     #[cfg(target_os = "windows")]
     isolated_registry: Option<IsolatedWindowsRegistry>,
 }
 
 impl IdaInitState {
-    pub fn deferred(allow_lumina: bool) -> Result<Self, String> {
+    pub fn deferred(policy: IdaRuntimePolicy) -> Result<Self, String> {
         Ok(Self {
             library_initialized: false,
-            version_mismatch: None,
-            allow_lumina,
+            install_fault: None,
+            policy,
             isolated_idausr: prepare_isolated_idausr(idalib::SDK_VERSION)?,
             #[cfg(target_os = "windows")]
             isolated_registry: None,
@@ -116,11 +138,34 @@ fn set_idausr(value: Option<&OsStr>) -> Result<(), String> {
     }
 }
 
+/// Everything that has to be true about the IDA this process found, checked
+/// once, in the order that produces the most useful complaint.
+///
+/// Two independent faults, and the version one goes first because it is the
+/// coarser statement: a runtime of the wrong release makes the directory
+/// question moot.
+fn check_ida_install(allow_mismatch: bool) -> Option<String> {
+    if let Some(fault) = check_ida_version() {
+        return Some(fault);
+    }
+    // The second half of the same question `install::preflight` asked before
+    // startup, now that IDA can answer it about itself rather than about
+    // `$IDADIR`. This is what catches an install resolved through `$IDAUSR`,
+    // the Windows registry or the working directory.
+    install::check_initialized(allow_mismatch)
+        .err()
+        .map(|mismatch| mismatch.to_string())
+}
+
 /// Check the IDA runtime version against the SDK we compiled with.
 ///
 /// IDA 9.4+ must match the SDK minor because adjacent releases are not ABI
 /// compatible. Older SDKs retain the major-only check for IDA 9.3's product
 /// version reporting workaround.
+///
+/// Note what this does *not* cover: a matching core library says nothing about
+/// the plugins, processor modules and loaders IDA reads out of `$IDADIR`, which
+/// is a separate install resolved by a separate mechanism. See [`install`].
 fn check_ida_version() -> Option<String> {
     let (sdk_major, sdk_minor) = idalib::SDK_VERSION;
     match idalib::version() {
@@ -482,17 +527,19 @@ fn configure_lumina(allow_lumina: bool, isolated_profile: bool) -> Result<(), St
     Ok(())
 }
 
-/// Initialize IDA on the main thread and record the version state.
+/// Initialize IDA on the main thread and record what it found.
 ///
-/// `allow_lumina` controls whether IDA keeps its automatic Lumina lookups
-/// enabled; when false they are disabled before any database is opened.
-pub fn init_ida_library(allow_lumina: bool) -> Result<IdaInitState, String> {
-    init_ida_library_with_isolated_idausr(None, allow_lumina)
+/// `policy.allow_lumina` controls whether IDA keeps its automatic Lumina
+/// lookups enabled; when false they are disabled before any database is opened.
+/// `policy.allow_mismatch` decides whether a mixed installation is a refusal or
+/// a warning.
+pub fn init_ida_library(policy: IdaRuntimePolicy) -> Result<IdaInitState, String> {
+    init_ida_library_with_isolated_idausr(None, policy)
 }
 
 fn init_ida_library_with_isolated_idausr(
     isolated_idausr: Option<IsolatedIdaUserDir>,
-    allow_lumina: bool,
+    policy: IdaRuntimePolicy,
 ) -> Result<IdaInitState, String> {
     let sdk_version = idalib::SDK_VERSION;
     let isolated_idausr = match isolated_idausr {
@@ -500,7 +547,7 @@ fn init_ida_library_with_isolated_idausr(
         None => prepare_isolated_idausr(sdk_version)?,
     };
     #[cfg(target_os = "windows")]
-    let isolated_registry = if allow_lumina {
+    let isolated_registry = if policy.allow_lumina {
         None
     } else {
         Some(IsolatedWindowsRegistry::prepare()?)
@@ -517,15 +564,15 @@ fn init_ida_library_with_isolated_idausr(
         idalib::enable_console_messages(false).map_err(|e| format!("{e}"))?;
     }
 
-    let version_mismatch = check_ida_version();
-    if let Some(ref msg) = version_mismatch {
+    let install_fault = check_ida_install(policy.allow_mismatch);
+    if let Some(ref msg) = install_fault {
         error!("{msg}");
     } else {
         #[cfg(target_os = "windows")]
         let lumina_profile_isolated = isolated_registry.is_some();
         #[cfg(not(target_os = "windows"))]
         let lumina_profile_isolated = isolated_idausr.is_some();
-        configure_lumina(allow_lumina, lumina_profile_isolated)?;
+        configure_lumina(policy.allow_lumina, lumina_profile_isolated)?;
         if should_check_license_expiry(sdk_version) {
             check_license_expiry()?;
         } else {
@@ -539,8 +586,8 @@ fn init_ida_library_with_isolated_idausr(
 
     Ok(IdaInitState {
         library_initialized: true,
-        version_mismatch,
-        allow_lumina,
+        install_fault,
+        policy,
         isolated_idausr,
         #[cfg(target_os = "windows")]
         isolated_registry,
@@ -556,8 +603,8 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
     let mut lock_file: Option<File> = None;
     let mut lock_path: Option<PathBuf> = None;
     let mut lib_initialized = init_state.library_initialized;
-    let mut version_mismatch = init_state.version_mismatch;
-    let allow_lumina = init_state.allow_lumina;
+    let mut install_fault = init_state.install_fault;
+    let policy = init_state.policy;
     let mut isolated_idausr = init_state.isolated_idausr;
     #[cfg(target_os = "windows")]
     let mut _isolated_registry = init_state.isolated_registry;
@@ -579,10 +626,10 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                 Some(OPEN_IDB_PROGRESS_TOTAL),
                 "Initializing IDA runtime on the main thread",
             );
-            match init_ida_library_with_isolated_idausr(isolated_idausr.take(), allow_lumina) {
+            match init_ida_library_with_isolated_idausr(isolated_idausr.take(), policy) {
                 Ok(init_state) => {
                     lib_initialized = init_state.library_initialized;
-                    version_mismatch = init_state.version_mismatch;
+                    install_fault = init_state.install_fault;
                     isolated_idausr = init_state.isolated_idausr;
                     #[cfg(target_os = "windows")]
                     {
@@ -601,17 +648,17 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
             }
         }
 
-        // If there is a version mismatch, reject every request with a
-        // clear error instead of segfaulting deep inside IDA.
-        if let Some(ref mismatch_msg) = version_mismatch {
+        // If this process found the wrong IDA, reject every request with a
+        // clear error instead of segfaulting deep inside it.
+        if let Some(ref fault) = install_fault {
             match req {
                 IdaRequest::Shutdown => {
-                    info!("Worker shutting down after SDK version mismatch");
+                    info!("Worker shutting down after an IDA installation fault");
                     shutdown_cleanup(&mut idb, &mut lock_file, &mut lock_path);
                     break;
                 }
                 other => {
-                    reject_with_version_error(other, mismatch_msg);
+                    reject_with_install_error(other, fault);
                     continue;
                 }
             }
@@ -1412,7 +1459,7 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                 let result = crate::crash_guard::crash_guarded("handle_lumina_lookup", || {
                     lumina::handle_pull(
                         &idb,
-                        allow_lumina,
+                        policy.allow_lumina,
                         addr,
                         name.as_deref(),
                         offset,
@@ -1438,7 +1485,7 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                 let result = crate::crash_guard::crash_guarded("handle_lumina_apply", || {
                     lumina::handle_pull(
                         &idb,
-                        allow_lumina,
+                        policy.allow_lumina,
                         addr,
                         name.as_deref(),
                         offset,
@@ -2180,7 +2227,7 @@ fn shutdown_cleanup(
     release_mcp_lock(lock_file, lock_path);
 }
 
-/// Send a version-mismatch error for every request variant so the
+/// Send an installation-fault error for every request variant so the
 /// agent gets a clear message instead of a segfault.
 /// Refuse an operation whose caller opened a database that is no longer the
 /// current one. `None` opts out (foreground tools legitimately target whatever
@@ -2207,8 +2254,8 @@ fn require_generation(
     Err(ToolError::DatabaseReplaced)
 }
 
-fn reject_with_version_error(req: IdaRequest, msg: &str) {
-    reject_with_error(req, ToolError::SdkVersionMismatch(msg.to_owned()));
+fn reject_with_install_error(req: IdaRequest, msg: &str) {
+    reject_with_error(req, ToolError::IdaInstallFault(msg.to_owned()));
 }
 
 fn reject_with_error(req: IdaRequest, err: ToolError) {

@@ -1,5 +1,6 @@
 #include <auto.hpp>
 #include <bytes.hpp>
+#include <diskio.hpp>
 #include <funcs.hpp>
 #include <loader.hpp>
 #include <nalt.hpp>
@@ -99,6 +100,27 @@ bool ida_mcp_mark_cfunc_dirty(uint64 address) {
 
 bool ida_mcp_init_hexrays() {
   return init_hexrays_plugin();
+}
+
+// The directory IDA resolves its own resource tree from — plugins, processor
+// modules, loaders, cfg. It is *not* necessarily the directory this process
+// loaded libida from: the linker honours RUNPATH, IDA honours $IDADIR, and the
+// two disagreeing is the whole reason `crate::ida::install` exists.
+//
+// Only `idadir(nullptr)` is bridged, not `get_ida_subdirs`. The user-plugin
+// search path ($IDAUSR/plugins) never holds the Hex-Rays modules, so appending
+// "plugins" to this answers the only question we ask of it.
+bool ida_mcp_idadir(char *buf, size_t buf_size) {
+  if (buf == nullptr || buf_size == 0)
+    return false;
+  const char *dir = idadir(nullptr);
+  if (dir == nullptr || dir[0] == '\0')
+    return false;
+  const size_t len = std::strlen(dir);
+  if (len + 1 > buf_size)
+    return false;
+  std::memcpy(buf, dir, len + 1);
+  return true;
 }
 
 int ida_mcp_enum_upsert_member(

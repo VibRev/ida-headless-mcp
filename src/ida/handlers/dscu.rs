@@ -15,15 +15,50 @@ use crate::ida::types::{DscStringMatch, DscSymbolMatch};
 
 #[cfg(feature = "ida-94")]
 fn require_dscu(idb: &Option<IDB>) -> Result<(), ToolError> {
-    idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
+    let db = idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
     if idalib::dscu::is_available() {
-        Ok(())
-    } else {
-        Err(ToolError::NotSupported(
-            "IDA dscu service is not available for the current database; open a dyld_shared_cache with IDA 9.4+ first"
-                .to_string(),
-        ))
+        return Ok(());
     }
+    Err(ToolError::NotSupported(dscu_unavailable_reason(
+        db.meta().input_file_path().trim_end_matches('\0'),
+    )))
+}
+
+/// Say which of the two ways a database can lack `dscu` this one is, and what
+/// follows from it.
+///
+/// The distinction is not cosmetic. `dscu` is owned by IDA's shared-cache
+/// *loader* and lives for as long as the cache is open; a database saved from
+/// that session and reopened later is a perfectly good database that simply has
+/// no loader attached any more. Nothing on this side can re-attach one — it is
+/// not a cache this engine dropped — so the honest answer is to name the file
+/// to reopen and to say what still works, rather than to imply a broken setup.
+#[cfg(feature = "ida-94")]
+fn dscu_unavailable_reason(input_file_path: &str) -> String {
+    let input = crate::non_empty_trimmed(Some(input_file_path));
+    let looks_like_a_cache = input.is_some_and(|path| {
+        std::path::Path::new(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.contains("dyld_shared_cache"))
+    });
+    if !looks_like_a_cache {
+        return format!(
+            "The dsc_* tools need a dyld_shared_cache, and this database was not created from \
+             one (input file: {input}). Nothing is wrong with the database — every other tool \
+             applies to it normally.",
+            input = input.unwrap_or("unknown"),
+        );
+    }
+    format!(
+        "IDA's dscu service is not attached to this database. It belongs to the shared-cache \
+         loader and only exists while the cache itself is open, so reopening a saved .i64 does \
+         not bring it back — this database was created from {input}. To use dsc_list_images, \
+         dsc_add_dylib or dsc_find_symbols, open that cache again rather than this .i64. \
+         Everything else — disassembly, decompilation, xrefs, strings, renaming — works on this \
+         database as it stands.",
+        input = input.unwrap_or("the shared cache"),
+    )
 }
 
 #[cfg(feature = "ida-94")]
@@ -342,4 +377,40 @@ pub fn handle_dsc_region_at(idb: &Option<IDB>, _ea: u64) -> Result<DscRegionQuer
     Err(ToolError::NotSupported(
         "Resolving a DSC region requires an IDA 9.4 build".to_string(),
     ))
+}
+
+#[cfg(all(test, feature = "ida-94"))]
+mod tests {
+    use super::dscu_unavailable_reason;
+
+    #[test]
+    fn a_saved_cache_database_is_told_which_file_to_reopen() {
+        let reason = dscu_unavailable_reason("/caches/dyld_shared_cache_arm64e");
+        assert!(
+            reason.contains("/caches/dyld_shared_cache_arm64e"),
+            "{reason}"
+        );
+        // The two things a reader has to take away: reopening the .i64 will
+        // never work, and the database is not otherwise damaged.
+        assert!(reason.contains("does not bring it back"), "{reason}");
+        assert!(reason.contains("decompilation"), "{reason}");
+    }
+
+    #[test]
+    fn a_database_from_something_else_is_not_blamed_on_a_lost_session() {
+        let reason = dscu_unavailable_reason("/bin/ls");
+        assert!(reason.contains("not created from"), "{reason}");
+        assert!(reason.contains("/bin/ls"), "{reason}");
+        // Nothing to reopen here, so the recovery advice must not appear.
+        assert!(!reason.contains("open that cache again"), "{reason}");
+    }
+
+    #[test]
+    fn an_unrecorded_input_file_still_produces_a_usable_sentence() {
+        // IDA pads this field with NULs and can leave it empty; neither should
+        // reach a caller as an empty pair of quotes.
+        let reason = dscu_unavailable_reason("");
+        assert!(reason.contains("unknown"), "{reason}");
+        assert!(!reason.contains("()"), "{reason}");
+    }
 }

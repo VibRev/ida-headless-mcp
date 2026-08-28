@@ -233,6 +233,15 @@ test-http-startup:
         bash ./http_startup_failure.sh
     echo "✅ HTTP startup failure test passed"
 
+# Verify a binary built for one IDA refuses to run against another's plugins,
+# and says so before it initializes IDA. Needs no IDA license, database, or
+# fixture: the gate runs before IDA exists.
+test-install-mismatch: build-check
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "🧪 Running IDA install mismatch test..."
+    MCP_BIN="{{ server_bin }}" bash ./ida_install_mismatch.sh
+
 # Verify legacy session DELETE cancels that session's background tasks on
 # single-worker HTTP (cancel-on-disconnect end-to-end oracle).
 test-session-cancel: fixture

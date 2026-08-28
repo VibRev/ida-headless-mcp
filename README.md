@@ -87,6 +87,16 @@ $env:IDADIR = "C:\Program Files\IDA Professional 9.4"
 That starts the default HTTP listener on `127.0.0.1:8765` and prints a security
 banner — enough to confirm the binary found IDA. Ctrl-C to stop it.
 
+`IDADIR` must name the same installation the binary was built for. The two
+halves of IDA are resolved separately — the core library by the dynamic linker,
+the plugins and processor modules by IDA out of `IDADIR` — so pointing `IDADIR`
+at a different release on a machine that has both leaves you running one
+version's core with another version's plugins. That used to start, and then fail
+as "Hex-Rays decompiler is not available", a segfault inside a processor module,
+or a `dyld_shared_cache` that would not open. It now refuses at startup and names
+both directories. Pass `--allow-ida-mismatch` (or `IDA_MCP_ALLOW_IDA_MISMATCH=1`)
+if you have a reason to run it anyway.
+
 ## Configure an MCP client
 
 MCP clients spawn the binary and talk over the pipe, so they need the stdio transport by name: `serve --mode stdio`. (A bare invocation serves HTTP — see [Streamable HTTP](#streamable-http).) After the binary is on `PATH` (or use the absolute path):
@@ -208,9 +218,9 @@ The equivalent environment setting is `IDA_MCP_ALLOW_LUMINA=true`. The isolated 
 ## Limitations
 
 - **You bring your own IDA.** No archive here contains IDA, its SDK, or its runtime libraries, and none of them will run without a licensed install.
-- **The decompiler-backed tools need Hex-Rays.** Without a decompiler license the worker reports "Hex-Rays decompiler is not available" at warm-up, and `decompile`, `pseudocode_at`, `diff_before_after` and the pseudocode part of `analyze_function` cannot answer. Everything built on disassembly still works.
+- **The decompiler-backed tools need Hex-Rays.** Without a decompiler the worker reports "Hex-Rays decompiler is not available" at warm-up — followed by what it observed: the processor, the module that processor needs, the modules actually installed, and whether the installation is internally consistent. `decompile`, `pseudocode_at`, `diff_before_after` and the pseudocode part of `analyze_function` cannot answer. Everything built on disassembly still works.
 - **Prebuilt binaries cover three platform pairs only** — Linux x86_64, macOS arm64, Windows x86_64. Anything else means building from source.
-- **A binary is tied to one IDA minor.** Mixing a 9.4 build with a non-9.4 runtime, or the reverse, is rejected before any database opens.
+- **A binary is tied to one IDA installation.** Mixing a 9.4 build with a non-9.4 runtime, or the reverse, is rejected before any database opens. Pointing `IDADIR` at an installation other than the one the core library was loaded from is rejected at startup, before IDA is initialized at all.
 - **Headless-only.** There is no debugger surface and no GUI control; `force_gui` is an error, not a fallback.
 - **HTTP is authenticated, always.** There is no anonymous mode, so a client that cannot send an `Authorization` header cannot use this transport.
 

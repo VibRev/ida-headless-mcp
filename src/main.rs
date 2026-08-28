@@ -53,6 +53,8 @@ const REQUEST_QUEUE_CAPACITY: usize = 64;
 struct Cli {
     #[command(flatten)]
     ida_network: IdaNetworkArgs,
+    #[command(flatten)]
+    ida_runtime: IdaRuntimeArgs,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -107,6 +109,12 @@ fn policy_args() -> Vec<clap::Arg> {
             // startup. Adding the parser here rather than in the kit keeps this
             // an env-var concern, which is the same reason `.env()` is applied
             // here in the first place.
+            // Their own heading, explicitly. These are added to the root with
+            // `.args()` *after* the flattened `#[command(next_help_heading)]`
+            // groups, so without one they inherit whichever group happens to be
+            // declared last — and then move to a different wrong group the next
+            // time someone adds one.
+            let arg = arg.help_heading("Tool filter");
             if arg.get_id() == READ_ONLY_ARG {
                 arg.value_parser(clap::builder::BoolishValueParser::new())
             } else {
@@ -133,6 +141,42 @@ impl IdaNetworkArgs {
     fn worker_args(&self) -> Vec<OsString> {
         if self.allow_lumina {
             vec![OsString::from("--allow-lumina")]
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+// Which IDA installation this process is willing to run against.
+//
+// Its own group rather than a field on `IdaNetworkArgs`: that heading says "IDA
+// network", and whether the core library and the resource tree came from one
+// install has nothing to do with the network.
+//
+// Deliberately not a `///` doc comment. clap turns a flattened group's doc
+// comment into help text, and the paragraph above is for whoever edits this
+// file, not for whoever runs `--help`.
+#[derive(Args, Debug, Clone, Default)]
+#[command(next_help_heading = "IDA runtime")]
+struct IdaRuntimeArgs {
+    /// Start even when IDA's core library and its plugins come from different
+    /// installations. Mixing them produces misleading Hex-Rays, processor and
+    /// loader failures rather than a clean error.
+    #[arg(
+        long = "allow-ida-mismatch",
+        env = ida_mcp::ida::install::ALLOW_MISMATCH_ENV,
+        global = true,
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    allow_ida_mismatch: bool,
+}
+
+impl IdaRuntimeArgs {
+    /// A waiver the supervisor granted has to reach the children that will
+    /// actually load IDA; they are the ones that would otherwise refuse.
+    fn worker_args(&self) -> Vec<OsString> {
+        if self.allow_ida_mismatch {
+            vec![OsString::from(ida_mcp::ida::install::ALLOW_MISMATCH_FLAG)]
         } else {
             Vec::new()
         }
@@ -293,6 +337,14 @@ use ida_mcp::MANAGEMENT_COMMANDS;
 /// that looks entirely intentional.
 const SERVE_COMMAND: &str = "serve";
 
+/// The one command that must keep working on a machine whose IDA is wrong.
+///
+/// Named here for the same reason as [`SERVE_COMMAND`]: `main` exempts it from
+/// the install gate, and an exemption keyed on a literal that no longer matches
+/// the subcommand would fail silently — as a refusal to run, in the one case
+/// that is supposed to be refusal-proof.
+const SKILLS_COMMAND: &str = "skills";
+
 /// Graft the derived tool tree onto the derive-generated root.
 ///
 /// Two clap idioms meet here: this binary's own commands come from `#[derive(Parser)]`,
@@ -397,10 +449,25 @@ fn main() -> anyhow::Result<()> {
     // Read before the `resolve` early-return: that branch never reaches
     // `Cli::from_arg_matches`, and the flags are `global(true)` on every level.
     let selection = PolicyArgs::read(&matches);
+    // Every path below except `skills` ends up loading IDA, so the install gate
+    // runs here rather than per-arm — including ahead of `resolve`, which
+    // returns without ever building a `Cli`. Doing it this early is the whole
+    // point: `serve` never initializes IDA in its own process, and a `worker`
+    // defers initialization to its first tool call, so both would otherwise
+    // report a mixed install as some unrelated failure much later.
+    //
+    // `skills` is exempt because `run_skills` answers from a manifest baked
+    // into this binary. Demanding a matching IDA to read it would break the
+    // command in exactly the situation it exists for.
+    let ida_runtime = <IdaRuntimeArgs as clap::FromArgMatches>::from_arg_matches(&matches)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if matches.subcommand_name() != Some(SKILLS_COMMAND) {
+        ida_mcp::ida::install::preflight(ida_runtime.allow_ida_mismatch)?;
+    }
     // Anything under `tool` is a derived tool; everything else at the root is
     // one of this engine's own commands and falls through untouched.
     if let Some((name, leaf)) = vibrev_kit::cli::resolve(&matches) {
-        return run_tool_cli(name, leaf);
+        return run_tool_cli(name, leaf, ida_runtime.allow_ida_mismatch);
     }
 
     let cli = <Cli as clap::FromArgMatches>::from_arg_matches(&matches)
@@ -422,8 +489,14 @@ fn main() -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("invalid supervisor tool filter: {e}"))?;
         Ok::<_, anyhow::Error>(Arc::new(policy))
     };
-    let allow_lumina = cli.ida_network.allow_lumina;
-    let worker_args = cli.ida_network.worker_args();
+    let ida_policy = ida::IdaRuntimePolicy {
+        allow_lumina: cli.ida_network.allow_lumina,
+        allow_mismatch: cli.ida_runtime.allow_ida_mismatch,
+    };
+    // Two contributors, one list: a child worker inherits both the Lumina
+    // decision and the install-mismatch waiver, because it is the child that
+    // loads IDA and would otherwise refuse on its own.
+    let worker_args = [cli.ida_network.worker_args(), cli.ida_runtime.worker_args()].concat();
     match cli
         .command
         .unwrap_or_else(|| Command::Serve(ServeArgs::default()))
@@ -456,9 +529,9 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Command::Worker(_args) => {
-            run_server_with_mode(build_filter()?, ServerMode::Worker, allow_lumina)
+            run_server_with_mode(build_filter()?, ServerMode::Worker, ida_policy)
         }
-        Command::Probe(args) => run_probe(args, allow_lumina),
+        Command::Probe(args) => run_probe(args, ida_policy),
         Command::Skills(args) => run_skills(args),
     }
 }
@@ -487,7 +560,7 @@ fn run_skills(args: vibrev_skills::SkillsArgs) -> anyhow::Result<()> {
 /// call happens on a background thread's runtime and this one goes straight into
 /// `run_ida_loop`. The difference is that there is exactly one call and then the
 /// worker is shut down.
-fn run_tool_cli(name: String, leaf: &clap::ArgMatches) -> anyhow::Result<()> {
+fn run_tool_cli(name: String, leaf: &clap::ArgMatches, allow_mismatch: bool) -> anyhow::Result<()> {
     let defs = IdaMcpServer::vibrev_tool_defs();
     let Some(def) = defs.iter().find(|d| d.name() == name) else {
         anyhow::bail!("unknown tool: {name}");
@@ -526,7 +599,12 @@ fn run_tool_cli(name: String, leaf: &clap::ArgMatches) -> anyhow::Result<()> {
     };
     let as_json = leaf.get_flag("__json");
 
-    let init_state = init_stdio_ida_state(false)?;
+    let init_state = init_stdio_ida_state(ida::IdaRuntimePolicy {
+        // Lumina stays off for a one-shot CLI call, as it always has: the
+        // caller asked one question of one database, not for a network lookup.
+        allow_lumina: false,
+        allow_mismatch,
+    })?;
     let (tx, rx) = mpsc::sync_channel(REQUEST_QUEUE_CAPACITY);
     let backend = Arc::new(IdaWorker::new(tx));
     let backend_for_call = backend.clone();
@@ -668,19 +746,19 @@ async fn wait_for_shutdown_signal() {
     vibrev_kit::transport::shutdown_signal().await;
 }
 
-fn init_stdio_ida_state(allow_lumina: bool) -> anyhow::Result<ida::IdaInitState> {
+fn init_stdio_ida_state(policy: ida::IdaRuntimePolicy) -> anyhow::Result<ida::IdaInitState> {
     // On Windows, IDA's init_library() probes console handles during
     // startup. In stdio mode the MCP transport captures stdin/stdout
     // for JSON-RPC framing, so init must run *before* the transport
     // starts — otherwise init_library() deadlocks on the owned handle.
     #[cfg(target_os = "windows")]
     {
-        ida::init_ida_library(allow_lumina)
+        ida::init_ida_library(policy)
             .map_err(|e| anyhow::anyhow!("IDA library initialization failed: {e}"))
     }
     #[cfg(not(target_os = "windows"))]
     {
-        ida::IdaInitState::deferred(allow_lumina)
+        ida::IdaInitState::deferred(policy)
             .map_err(|e| anyhow::anyhow!("IDA startup preparation failed: {e}"))
     }
 }
@@ -791,10 +869,10 @@ fn run_supervisor_stdio(
 fn run_server_with_mode(
     filter: Arc<ToolPolicy>,
     mode: ServerMode,
-    allow_lumina: bool,
+    policy: ida::IdaRuntimePolicy,
 ) -> anyhow::Result<()> {
     info!(?mode, "Starting IDA MCP Server (stdio transport)");
-    let init_state = init_stdio_ida_state(allow_lumina)?;
+    let init_state = init_stdio_ida_state(policy)?;
 
     // Create channel for IDA requests
     let (tx, rx) = mpsc::sync_channel(REQUEST_QUEUE_CAPACITY);
@@ -1046,13 +1124,13 @@ fn run_supervisor_http(
     })
 }
 
-fn run_probe(args: ProbeArgs, allow_lumina: bool) -> anyhow::Result<()> {
+fn run_probe(args: ProbeArgs, policy: ida::IdaRuntimePolicy) -> anyhow::Result<()> {
     info!("Starting IDA MCP Server (probe mode)");
     if let Ok(idadir) = std::env::var("IDADIR") {
         info!("IDADIR={}", idadir);
     }
     info!("Initializing IDA library on main thread");
-    let _init_state = ida::init_ida_library(allow_lumina)
+    let _init_state = ida::init_ida_library(policy)
         .map_err(|e| anyhow::anyhow!("IDA library initialization failed: {e}"))?;
     info!("IDA library initialized successfully");
     if let Ok(ver) = idalib::version() {
@@ -1146,7 +1224,13 @@ fn run_probe(args: ProbeArgs, allow_lumina: bool) -> anyhow::Result<()> {
             .function_at(addr)
             .ok_or_else(|| anyhow::anyhow!("Function not found at address {:#x}", addr))?;
         if !db.decompiler_available() {
-            return Err(anyhow::anyhow!("Decompiler not available"));
+            // `probe` is the command someone reaches for when the server is
+            // already failing, so it is the last place that should answer with
+            // the bare sentence they came here to explain.
+            return Err(anyhow::anyhow!(
+                "{}",
+                ida::hexrays::HexraysDiagnostics::collect(&db).into_error()
+            ));
         }
         let cfunc = db
             .decompile(&func)

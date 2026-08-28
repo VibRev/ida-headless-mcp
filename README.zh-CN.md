@@ -83,6 +83,8 @@ $env:IDADIR = "C:\Program Files\IDA Professional 9.4"
 
 这会启动默认的 HTTP 监听（`127.0.0.1:8765`）并打印一段安全横幅——足以确认二进制找到了 IDA。Ctrl-C 停止。
 
+`IDADIR` 必须指向构建时所用的那一个 IDA 安装。IDA 的两半是分开解析的——内核库由动态链接器解析，插件和处理器模块由 IDA 自己按 `IDADIR` 解析——所以在同时装了多个版本的机器上把 `IDADIR` 指向另一个版本，就会用一个版本的内核配另一个版本的插件。以前这样是能启动的，然后表现为「Hex-Rays decompiler is not available」、处理器模块里的段错误、或者 `dyld_shared_cache` 打不开。现在它会在启动时拒绝，并打印出两个目录。确实有理由这么跑，就加 `--allow-ida-mismatch`（或 `IDA_MCP_ALLOW_IDA_MISMATCH=1`）。
+
 ## 配置 MCP 客户端
 
 MCP 客户端会拉起这个进程并通过管道对话，所以要明确指定 stdio 传输：`serve --mode stdio`。（不带参数直接运行走的是 HTTP，见 [Streamable HTTP](#streamable-http)。）把二进制放到 `PATH` 上（或使用绝对路径）后：
@@ -199,9 +201,9 @@ ida-headless-mcp --allow-lumina
 ## 已知限制
 
 - **IDA 需要自备。** 这里的任何产物都不包含 IDA、它的 SDK 或运行时库，没有已授权的安装就跑不起来。
-- **依赖反编译器的工具需要 Hex-Rays。** 没有反编译器授权时，worker 在预热阶段就会报 "Hex-Rays decompiler is not available"，`decompile`、`pseudocode_at`、`diff_before_after` 以及 `analyze_function` 里的伪代码部分都给不出结果；基于反汇编的功能不受影响。
+- **依赖反编译器的工具需要 Hex-Rays。** 没有反编译器时，worker 在预热阶段会报 "Hex-Rays decompiler is not available"，后面跟着它实际观察到的东西：处理器、该处理器需要哪个模块、装了哪些模块、以及这套安装是否自洽。`decompile`、`pseudocode_at`、`diff_before_after` 以及 `analyze_function` 里的伪代码部分都给不出结果；基于反汇编的功能不受影响。
 - **预编译产物只覆盖三种平台组合**——Linux x86_64、macOS arm64、Windows x86_64。其余情况只能从源码构建。
-- **一份二进制绑定一个 IDA 小版本。** 用 9.4 的构建去配非 9.4 的运行时（或者反过来），在打开任何数据库之前就会被拒绝。
+- **一份二进制绑定一个 IDA 安装。** 用 9.4 的构建去配非 9.4 的运行时（或者反过来），在打开任何数据库之前就会被拒绝。把 `IDADIR` 指向与内核库来源不同的另一个安装，会在启动时——IDA 还没初始化之前——直接被拒绝。
 - **仅无头。** 没有调试器接口，也没有 GUI 控制；`force_gui` 是错误，不是降级。
 - **HTTP 始终需要鉴权。** 没有匿名模式，发不出 `Authorization` 头的客户端用不了这条传输。
 

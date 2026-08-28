@@ -514,8 +514,11 @@ impl IdaMcpServer {
     }
 
     #[vibrev_tool(
-        description = "Report auto-analysis status (auto_is_ok, auto_state). \
-        Use this to check whether analysis-dependent tools (xrefs, decompile) are fully ready.",
+        description = "Report auto-analysis readiness. Branch on auto_is_ok and nothing else: \
+        false means run analyze_funcs before trusting xrefs, decompile or any count. \
+        auto_state is IDA's AU_* bookkeeping and is not a readiness signal — a fully analyzed \
+        database reports AU_NONE, the same value it reports the instant it is opened, so \
+        AU_NONE alongside analysis_running=true is normal rather than contradictory.",
         output = "responses::AnalysisStatusOutput",
         title = "Auto-analysis readiness",
         annotations(
@@ -1324,7 +1327,9 @@ impl IdaMcpServer {
     #[vibrev_tool(
         description = "List the dylib images in an open dyld_shared_cache (requires prior \
         open_dsc; IDA 9.4+). Opening a DSC maps the header only, so start here to find the \
-        image you want, then map it with dsc_add_dylib. \
+        image you want, then map it with dsc_add_dylib. Every dsc_* tool needs the cache \
+        itself open: the service belongs to IDA's loader, so a .i64 saved from that session \
+        and reopened later has no dsc_* support even though it disassembles normally. \
         Answers {images, total, next_offset, input_file_path}.",
         output = "responses::DscImageListOutput",
         title = "Shared-cache image table",

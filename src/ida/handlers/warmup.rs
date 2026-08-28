@@ -2,6 +2,7 @@
 
 use crate::error::ToolError;
 use crate::ida::handlers::strings::rebuild_string_index;
+use crate::ida::hexrays::HexraysDiagnostics;
 use crate::ida::sdk_bridge;
 use crate::ida::types::{WarmupResult, WarmupStep};
 use idalib::IDB;
@@ -30,7 +31,7 @@ pub fn handle_warmup(
         steps.push(run_build_caches(db));
     }
     if init_hexrays {
-        steps.push(run_init_hexrays());
+        steps.push(run_init_hexrays(db));
     }
     Ok(WarmupResult::from_steps(steps))
 }
@@ -41,13 +42,23 @@ fn run_build_caches(db: &IDB) -> WarmupStep {
     WarmupStep::ok(BUILD_CACHES_STEP, elapsed_ms(started))
 }
 
-fn run_init_hexrays() -> WarmupStep {
+fn run_init_hexrays(db: &IDB) -> WarmupStep {
     let started = Instant::now();
     if sdk_bridge::init_hexrays() {
-        WarmupStep::ok(INIT_HEXRAYS_STEP, elapsed_ms(started))
-    } else {
-        WarmupStep::err(INIT_HEXRAYS_STEP, elapsed_ms(started), HEXRAYS_UNAVAILABLE)
+        return WarmupStep::ok(INIT_HEXRAYS_STEP, elapsed_ms(started));
     }
+    // The failing step is the one place a caller is guaranteed to read about
+    // the decompiler, so it carries the diagnosis rather than the constant.
+    // Collecting it costs a directory listing and a licence query, both of
+    // which are only reached once the plugin has already refused.
+    WarmupStep::err(
+        INIT_HEXRAYS_STEP,
+        elapsed_ms(started),
+        format!(
+            "{HEXRAYS_UNAVAILABLE}: {}",
+            HexraysDiagnostics::collect(db).summary()
+        ),
+    )
 }
 
 /// Map a child `decompile` error onto Hex-Rays warmup success or failure.
@@ -56,12 +67,15 @@ fn run_init_hexrays() -> WarmupStep {
 /// without a public MCP tool, so they probe via `decompile`. That handler
 /// checks `decompiler_available()` before looking up a function: "function not
 /// found" means the plugin answered, "decompiler not available" is a real miss.
+///
+/// A real miss now arrives carrying its diagnosis, so the message is passed
+/// through rather than replaced by [`HEXRAYS_UNAVAILABLE`]. Replacing it would
+/// throw away the only explanation the caller is going to get — this is the
+/// probe a pooled session uses, so it is the *usual* path, not a fallback.
 pub fn classify_hexrays_probe(error: &ToolError) -> Result<(), String> {
     let message = error.to_string();
     let lowered = message.to_ascii_lowercase();
-    if lowered.contains("decompiler not available") {
-        Err(HEXRAYS_UNAVAILABLE.to_string())
-    } else if lowered.contains("function not found") || lowered.contains("outside valid range") {
+    if lowered.contains("function not found") || lowered.contains("outside valid range") {
         Ok(())
     } else {
         Err(message)
@@ -121,20 +135,27 @@ mod tests {
         assert!(classify_hexrays_probe(&ToolError::FunctionNotFound(0)).is_ok());
         assert!(classify_hexrays_probe(&ToolError::AddressOutOfRange(u64::MAX)).is_ok());
         assert_eq!(
-            classify_hexrays_probe(&ToolError::DecompilerUnavailable).unwrap_err(),
-            HEXRAYS_UNAVAILABLE
-        );
-        assert_eq!(
             classify_hexrays_probe(&ToolError::IdaError(
                 "Function not found at address 0xffffffffffffffff".to_string()
             ))
             .ok(),
             Some(())
         );
-        assert_eq!(
-            classify_hexrays_probe(&ToolError::IdaError("Decompiler not available".to_string()))
-                .unwrap_err(),
-            HEXRAYS_UNAVAILABLE
-        );
+    }
+
+    #[test]
+    fn a_real_miss_reaches_the_session_with_its_diagnosis_intact() {
+        // The probe is how a pooled session learns about the decompiler, so
+        // anything it drops here is gone for good. It used to answer every miss
+        // with one constant, which threw away the only sentence saying *why*.
+        let diagnosed = "Decompiler not available: IDA's plugin directory has no hexarc module \
+                         for processor ARM (64-bit). It installs: hexx64.";
+        // `IdaErrorDetail` is what `HexraysDiagnostics::into_error` produces and
+        // what `crate::ida::remote` reconstructs on the far side of the hop.
+        let error = ToolError::IdaErrorDetail {
+            message: diagnosed.to_string(),
+            detail: Box::new(json!({ "expected_module": "hexarc" })),
+        };
+        assert_eq!(classify_hexrays_probe(&error).unwrap_err(), diagnosed);
     }
 }

@@ -47,9 +47,6 @@ pub enum ToolError {
     #[error("Function not found: {0}")]
     FunctionNameNotFound(String),
 
-    #[error("Decompiler not available")]
-    DecompilerUnavailable,
-
     #[error("Operation timed out after {0} seconds")]
     Timeout(u64),
 
@@ -117,8 +114,16 @@ pub enum ToolError {
     #[error("Worker channel closed")]
     WorkerClosed,
 
-    #[error("SDK version mismatch: {0}")]
-    SdkVersionMismatch(String),
+    /// This process cannot safely touch a database, because the IDA it found is
+    /// not the IDA it was built for.
+    ///
+    /// Two distinct faults arrive here — a runtime of the wrong release, and a
+    /// runtime of the right release paired with another install's plugins — and
+    /// the payload is self-describing in both cases, which is why there is no
+    /// prefix. Anything added here would be read *before* a message whose first
+    /// job is to say which of the two happened.
+    #[error("{0}")]
+    IdaInstallFault(String),
 }
 
 impl ToolError {

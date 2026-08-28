@@ -67,6 +67,27 @@ C:\Program Files\IDA Professional 9.4
 For SDK-only CI builds, set `IDASDKDIR`. Runtime tests still require a matching
 licensed installation on the same platform and architecture.
 
+### `IDADIR` has to match the build
+
+`set_rpath` in `build.rs` embeds several candidate install directories in
+RUNPATH, so `libida` is found by the dynamic linker regardless of `IDADIR`.
+IDA, meanwhile, reads its plugins, processor modules and loaders out of
+`IDADIR`. Setting `IDADIR` to a release other than the one this binary links
+against therefore resolves both halves successfully — to two different installs.
+
+No version check catches this, because there is no version mismatch: the core
+library really is the version the SDK expects. The symptoms are all downstream —
+`Hex-Rays decompiler is not available`, a SIGSEGV inside a processor module
+(reported by the supervisor as `worker transport closed`), a `dyld_shared_cache`
+that will not open — and none of them names the cause.
+
+`crate::ida::install` compares the directory the core library was loaded from
+against the one IDA resolves its resources to, and refuses to start when they
+differ, naming both. `--allow-ida-mismatch` / `IDA_MCP_ALLOW_IDA_MISMATCH=1`
+downgrades the refusal to a warning; the supervisor forwards the waiver to the
+child workers it spawns. `just test-install-mismatch` covers the gate and needs
+no licence.
+
 ## Output and run modes
 
 The 9.4 binary is `target/release/ida-headless-mcp`; 9.2 and 9.3 builds are

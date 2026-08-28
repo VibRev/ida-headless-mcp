@@ -70,8 +70,8 @@ pub use error::ToolError;
 pub use ida::{
     init_ida_library, run_ida_loop, AddressInfo, ApplyTypesSpec, BasicBlockInfo, BytesResult,
     DbInfo, ExportInfo, FunctionInfo, FunctionListResult, FunctionRangeInfo, IdaInitState,
-    IdaRequest, IdaWorker, ImportInfo, OpenSpec, SegmentInfo, StringInfo, StringListResult,
-    StringXrefInfo, StringXrefsResult, SymbolInfo, XRefInfo,
+    IdaRequest, IdaRuntimePolicy, IdaWorker, ImportInfo, OpenSpec, SegmentInfo, StringInfo,
+    StringListResult, StringXrefInfo, StringXrefsResult, SymbolInfo, XRefInfo,
 };
 pub use server::catalog::ToolCategory;
 pub use server::{IdaMcpServer, ServerMode};
