@@ -21,7 +21,6 @@
 //! So this module does not compare version numbers. It asks the question the
 //! version check cannot: did the two halves come from the same directory?
 
-use std::ffi::CStr;
 use std::path::{Path, PathBuf};
 
 use tracing::{debug, warn};
@@ -245,6 +244,10 @@ fn normalize(path: &Path) -> PathBuf {
 /// the idalib entry point installed beside them. Either one answers the only
 /// question asked here, which is *which directory*, so the prefix is enough and
 /// the per-platform suffixes do not need enumerating.
+///
+/// Windows names its module `ida.dll` and asks the loader for it by name, so
+/// the byte-slice form has no caller there outside this module's own tests.
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn core_library_dir(raw: &[u8]) -> Option<PathBuf> {
     let path = path_from_bytes(raw)?;
     let name = path.file_name()?.to_str()?;
@@ -277,6 +280,8 @@ pub(crate) fn path_from_bytes(raw: &[u8]) -> Option<PathBuf> {
 /// process start — this needs no `init_library()` and no database.
 #[cfg(target_os = "linux")]
 pub(crate) fn loaded_core_dir() -> Option<PathBuf> {
+    use std::ffi::CStr;
+
     unsafe extern "C" fn visit(
         info: *mut libc::dl_phdr_info,
         _size: libc::size_t,
@@ -306,15 +311,30 @@ pub(crate) fn loaded_core_dir() -> Option<PathBuf> {
     found
 }
 
+/// dyld's image list, declared here rather than taken from `libc`.
+///
+/// `libc` deprecated both of these in favour of `mach2`, and this crate's
+/// clippy gate is `-D warnings`, so using them would fail the build. They are
+/// two stable C entry points in libSystem, which every macOS binary links, so
+/// declaring them costs one extern block and saves a dependency added for two
+/// signatures.
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn _dyld_image_count() -> u32;
+    fn _dyld_get_image_name(image_index: u32) -> *const std::ffi::c_char;
+}
+
 #[cfg(target_os = "macos")]
 pub(crate) fn loaded_core_dir() -> Option<PathBuf> {
+    use std::ffi::CStr;
+
     // SAFETY: the dyld image list only changes under dlopen/dlclose. This runs
     // on the main thread during startup, before any database is opened.
-    let count = unsafe { libc::_dyld_image_count() };
+    let count = unsafe { _dyld_image_count() };
     (0..count).find_map(|index| {
         // SAFETY: `index` is below the count read above, and the returned
         // pointer is a NUL-terminated path owned by dyld.
-        let name = unsafe { libc::_dyld_get_image_name(index) };
+        let name = unsafe { _dyld_get_image_name(index) };
         if name.is_null() {
             return None;
         }
