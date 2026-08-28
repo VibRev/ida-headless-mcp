@@ -59,6 +59,36 @@ jobs:
       # These two run everywhere: the crate carries `cfg(windows)` paths, process
       # handling, and file locking that Linux cannot answer for.
       - run: cargo clippy --all-targets -- -D warnings
+
+      # The unit tests never open a database, but the binary they live in links
+      # libida/libidalib, so the loader has to find them before `main` runs. A
+      # runner has no IDA install; what it linked against are the stub libraries
+      # the idalib SDK submodule ships. Cargo records that directory as a
+      # link-search path and emits no rpath, so the loader needs telling
+      # separately. The path is read back out of the build script's own output
+      # rather than reconstructed, because its platform subdirectory and the
+      # checkout hash above it are both cargo's to choose.
+      #
+      # This became necessary when the default SDK moved to 9.4; the 9.2 default
+      # that preceded it resolved without help.
+      - name: Point the loader at the SDK stub libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir=$(grep -h '^cargo::rustc-link-search=native=' \
+                  target/debug/build/idalib-*/output 2>/dev/null \
+                | sed 's/.*native=//' | head -1)
+          if [ -z "$dir" ]; then
+            echo "no link-search path in any idalib build output" >&2
+            exit 1
+          fi
+          echo "SDK libraries: $dir"
+          case "${{ runner.os }}" in
+            Linux)   echo "LD_LIBRARY_PATH=$dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV" ;;
+            macOS)   echo "DYLD_LIBRARY_PATH=$dir${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" >> "$GITHUB_ENV" ;;
+            Windows) echo "PATH=$dir;$PATH" >> "$GITHUB_ENV" ;;
+          esac
+
       - run: cargo test --locked
 
   build:
