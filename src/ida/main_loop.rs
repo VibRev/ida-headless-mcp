@@ -4,7 +4,7 @@ use std::ffi::{c_char, CString, OsStr, OsString};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use idalib::IDB;
 use tracing::{debug, error, info, warn};
@@ -17,6 +17,7 @@ use crate::ida::handlers::{
     warmup, xrefs,
 };
 use crate::ida::install;
+use crate::ida::interrupt;
 use crate::ida::lock::release_mcp_lock;
 use crate::ida::observability::{
     emit_progress, ensure_not_cancelled, ProgressHeartbeat, OPEN_IDB_PROGRESS_TOTAL,
@@ -30,6 +31,16 @@ use crate::ida::types::{ConditionalCloseResult, DatabaseGeneration, OpenedDataba
 
 #[cfg(feature = "ida-94")]
 const AUTO_USE_LUMINA_REGISTRY_VALUE: &str = "AutoUseLumina";
+
+/// How long the worker loop waits for a request before re-reading
+/// [`interrupt::requested`].
+///
+/// A signal handler cannot pack a database — that is an IDA call, and IDA is
+/// only touched from this thread — so an interrupt is a flag this loop has to
+/// come back and read. Matches the 200ms the stdio transports already poll at
+/// in `main.rs`; the cost of a shorter interval is a wakeup that finds nothing,
+/// and of a longer one, a Ctrl+C that feels ignored.
+const INTERRUPT_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 unsafe extern "C" {
     fn qsetenv(varname: *const c_char, value: *const c_char) -> bool;
@@ -609,7 +620,31 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
     #[cfg(target_os = "windows")]
     let mut _isolated_registry = init_state.isolated_registry;
 
-    while let Ok(req) = rx.recv() {
+    // Before the first request, so a worker that is interrupted while still
+    // idle leaves the same way one that has a database open does. Armed again
+    // after the deferred init below, because that is where IDA takes SIGINT
+    // back. See `crate::ida::interrupt`.
+    interrupt::arm();
+
+    loop {
+        if let Some(signal) = interrupt::requested() {
+            interrupted_shutdown(
+                signal,
+                &mut idb,
+                &mut lock_file,
+                &mut lock_path,
+                isolated_idausr.take(),
+            );
+        }
+
+        let req = match rx.recv_timeout(INTERRUPT_POLL_INTERVAL) {
+            Ok(req) => req,
+            // Nothing to serve and nobody left to serve it to; the pre-poll
+            // loop is the only thing an interrupt needs.
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+
         // A guarded call took SIGSEGV or SIGBUS. IDA is not asked anything
         // else in this process — not the request, not a close, not the drop of
         // the open database — because the heap it would use is the one the
@@ -656,6 +691,10 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                     {
                         _isolated_registry = init_state.isolated_registry;
                     }
+                    // `init_library` just reset SIGINT to `SIG_DFL`. Until this
+                    // runs, a Ctrl+C would kill the process outright and leave
+                    // the database unpacked on disk.
+                    interrupt::arm();
                 }
                 Err(err) => {
                     reject_with_error(
@@ -2247,6 +2286,44 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
         release_mcp_lock(&mut lock_file, &mut lock_path);
         crate::crash_guard::exit_if_retired();
     }
+}
+
+/// Save the open database and leave, because someone asked this process to stop.
+///
+/// The exit is here rather than a `break` out of the loop on purpose. Returning
+/// would hand control back to `run_server_with_mode`, which joins a server
+/// thread parked on a shutdown notification that can no longer arrive — the
+/// tokio handler that used to send it is the one IDA displaced and
+/// [`interrupt::arm`] took over. There is nothing left for this process to do
+/// once the database is packed, so it says so with the status a shell reads as
+/// "died of this signal".
+fn interrupted_shutdown(
+    signal: i32,
+    idb: &mut Option<IDB>,
+    lock_file: &mut Option<File>,
+    lock_path: &mut Option<PathBuf>,
+    isolated_idausr: Option<IsolatedIdaUserDir>,
+) -> ! {
+    // An earlier guarded call jumped out of a fatal signal handler, so the open
+    // database is leaked rather than closed: dropping the `IDB` is IDA packing
+    // and writing it through a heap left in an unknown state, and losing the
+    // unsaved analysis beats saving a database assembled from a corrupt one.
+    // The same trade the post-loop path makes, for the same reason.
+    if let Some(fatal) = crate::crash_guard::caught_signal() {
+        warn!(
+            signal,
+            fatal, "Interrupted after a fatal signal; leaving the database unwritten"
+        );
+        std::mem::forget(idb.take());
+    } else {
+        info!(signal, "Interrupted; closing the database before exit");
+    }
+    // A no-op for the database itself above; still owes the lock file either way.
+    shutdown_cleanup(idb, lock_file, lock_path);
+    // `exit` runs no destructors, and this one restores IDAUSR and removes the
+    // temporary directory it pointed at.
+    drop(isolated_idausr);
+    std::process::exit(128 + signal)
 }
 
 fn shutdown_cleanup(

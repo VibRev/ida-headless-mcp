@@ -8,6 +8,7 @@ pub mod handlers;
 pub mod hexrays;
 pub mod install;
 pub mod int_spec;
+pub mod interrupt;
 pub(crate) mod leftover;
 pub mod lock;
 mod main_loop;

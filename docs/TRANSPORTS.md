@@ -272,6 +272,24 @@ whole JSON-RPC envelopes — including tool arguments — to stderr.
 
 ## Shutdown
 
-The server listens for SIGINT/SIGTERM/SIGQUIT and will close the open database
-before exiting when possible.
+The server listens for SIGINT/SIGTERM/SIGQUIT and closes every open database —
+packing it to its `.i64` — before it exits. Ctrl+C is the ordinary way to stop
+it; the databases are saved, not discarded.
+
+Workers run in their own process group, so a terminal Ctrl+C reaches the
+supervisor alone and the supervisor closes the databases in order. A worker
+signalled directly saves its own database and exits `130`.
+
+**Interrupting a busy worker.** The IDA SDK is single-threaded and blocking, so
+an interrupt that lands during a long call — `auto_wait` on a large binary,
+a slow decompilation — cannot be acted on until that call returns. The first
+Ctrl+C prints
+
+```
+interrupt: closing the open database before exit; press Ctrl+C again to exit now and lose unsaved analysis
+```
+
+and waits. **A second Ctrl+C exits immediately and the analysis since the last
+save is lost** — that is the escape hatch, not the default, so do not use it to
+hurry a shutdown that is already under way.
 

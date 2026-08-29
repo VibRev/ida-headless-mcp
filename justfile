@@ -73,6 +73,10 @@ test-pool-crash: build
 test-crash-signal: build
     cd e2e && SERVER_BIN=../target/debug/ida-headless-mcp RUST_LOG=ida_mcp=trace just test-crash-signal
 
+# Verify Ctrl+C packs the open database to a .i64 before the process exits (debug)
+test-ctrlc-save: build
+    cd e2e && SERVER_BIN=../target/debug/ida-headless-mcp RUST_LOG=ida_mcp=trace just test-ctrlc-save
+
 # Run HTTP worker-pool exhaustion test (debug)
 test-pool-exhaustion: build
     cd e2e && SERVER_BIN=../target/debug/ida-headless-mcp RUST_LOG=ida_mcp=trace just test-pool-exhaustion

@@ -332,6 +332,30 @@ test-crash-signal: fixture
         bash ./supervisor_crash_signal.sh
     echo "✅ Supervisor guarded-signal retirement test passed"
 
+# Run the Ctrl+C save-then-exit test
+
+# A terminal interrupt has to pack the open database to a .i64 before leaving,
+# on the supervisor face and on the bare worker face, and a second interrupt has
+# to get out of an IDA call that will not return.
+test-ctrlc-save: fixture
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -x "{{ server_bin }}" ]; then
+        echo "Server binary not found: {{ server_bin }}"
+        echo "Run 'just build' first"
+        exit 1
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "jq is required for the Ctrl+C test (brew install jq)"
+        exit 1
+    fi
+    echo "🧪 Running Ctrl+C save-then-exit test..."
+    PORT=$((9700 + RANDOM % 90)) \
+        RUST_LOG="{{ rust_log }}" IDB_PATH="{{ test_bin }}" \
+        MCP_HTTP_BIN="{{ server_bin }}" \
+        bash ./ctrlc_saves_database.sh
+    echo "✅ Ctrl+C save-then-exit test passed"
+
 # Run HTTP worker-pool exhaustion test
 test-pool-exhaustion: fixture
     #!/usr/bin/env bash

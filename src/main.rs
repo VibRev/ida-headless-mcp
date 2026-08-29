@@ -914,6 +914,13 @@ fn run_server_with_mode(
             let shutdown_notify = Arc::new(Notify::new());
             let shutdown_signal = shutdown_notify.clone();
 
+            // Windows-only in practice. On unix `ida::interrupt` holds these
+            // signals — it has to, because IDA resets their disposition on
+            // `init_library()` and this handler does not survive that — and the
+            // worker loop saves the database and exits the process directly,
+            // never returning here. Kept because Windows delivers console
+            // control events, which IDA leaves alone, so this is still the live
+            // path there. Client disconnect below is the arm that fires on both.
             let shutdown_tasks = task_registry.clone();
             tokio::spawn(async move {
                 wait_for_shutdown_signal().await;

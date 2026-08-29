@@ -435,6 +435,15 @@ impl WorkerPool {
             cmd.env_remove(var);
         }
         cmd.kill_on_drop(true);
+        // A terminal Ctrl+C signals the whole foreground process group. Sharing
+        // the supervisor's group, every worker took SIGINT at the same instant
+        // the supervisor did and raced its own shutdown against the parent's
+        // `close_idb` — which then read the closed transport as a dead child and
+        // sent SIGKILL, mid-save, losing the database. The supervisor is the
+        // only thing that knows which databases are open, so it is the only
+        // thing that gets to close them.
+        #[cfg(unix)]
+        cmd.process_group(0);
         cmd
     }
 
