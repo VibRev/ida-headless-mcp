@@ -356,6 +356,11 @@ fn the_supervisor_face_is_object_rooted_and_keeps_its_schemas() {
             .unwrap_or_else(|| panic!("{name} lost its outputSchema"));
         if *name == "server_health" {
             assert_eq!(
+                schema.get("type").and_then(Value::as_str),
+                Some("object"),
+                "server_health output schemas need an explicit object root for strict clients"
+            );
+            assert_eq!(
                 schema.get("anyOf").and_then(Value::as_array).map(Vec::len),
                 Some(2),
                 "server_health must advertise its two success shapes"
@@ -368,6 +373,25 @@ fn the_supervisor_face_is_object_rooted_and_keeps_its_schemas() {
             );
         }
     }
+}
+
+#[test]
+fn strict_clients_get_object_schemas_for_dynamic_session_and_mutation_fields() {
+    let native = catalog::native_tool("sdk_mutation").expect("sdk_mutation");
+    assert!(
+        native.input_schema["properties"]["value"].is_object(),
+        "sdk_mutation.value must publish a JSON schema object"
+    );
+
+    let supervisor = SupervisorServer::advertised_tools(true).expect("catalog");
+    let open = supervisor
+        .iter()
+        .find(|tool| tool.name.as_ref() == "idb_open")
+        .expect("idb_open");
+    assert!(
+        open.output_schema.as_ref().expect("outputSchema")["properties"]["warmup"].is_object(),
+        "idb_open.warmup must publish a JSON schema object"
+    );
 }
 
 /// These four answer one shape, not array-or-object.

@@ -158,7 +158,7 @@ impl IdaMcpServer {
                     .value
                     .as_ref()
                     .ok_or_else(|| ToolError::InvalidParams("value is required".to_string()))
-                    .and_then(address::value_to_single_address)),
+                    .and_then(crate::server::address::AddressArg::to_single)),
                 bitfield: req.bitfield.unwrap_or(false),
             },
             "rename_variable" => SdkMutation::RenameVariable {

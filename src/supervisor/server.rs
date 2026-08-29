@@ -507,6 +507,11 @@ fn server_health_output_schema() -> Arc<rmcp::model::JsonObject> {
     detach_schema_document_keys(&mut all, &mut defs);
 
     let mut schema = Map::new();
+    // Claude Code and several other MCP consumers require every output schema
+    // document to declare an object root. The two valid success payloads are
+    // still represented by `anyOf`; the root type makes that contract explicit
+    // without changing either branch.
+    schema.insert("type".to_string(), Value::String("object".to_string()));
     schema.insert("anyOf".to_string(), json!([one, all]));
     if !defs.is_empty() {
         schema.insert("$defs".to_string(), Value::Object(defs));

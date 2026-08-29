@@ -38,8 +38,9 @@ impl AddressArg {
     }
 }
 
-/// Flatten a leftover untyped `Value` the same way [`AddressArg::to_single`] does.
-/// Used by `sdk_mutation.value`, which is an integer, not an address field.
+/// Parse one address-like JSON value into an integer. This is shared by
+/// [`AddressArg`] and keeps the accepted string/number/array forms in one
+/// place.
 pub(crate) fn value_to_single_address(value: &Value) -> Result<u64, ToolError> {
     let addrs = value_to_addresses(value)?;
     addrs

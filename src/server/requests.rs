@@ -990,7 +990,9 @@ pub struct SdkMutationRequest {
     pub size: Option<i64>,
     pub enum_name: Option<String>,
     pub member_name: Option<String>,
-    pub value: Option<Value>,
+    /// Enum member value. Accept the same string/number forms as an address;
+    /// IDA ultimately parses it as one integer.
+    pub value: Option<crate::server::address::AddressArg>,
     pub bitfield: Option<bool>,
     pub function_address: Option<AddressArg>,
     pub old_name: Option<String>,

@@ -1,5 +1,6 @@
 //! Response types for IDA worker operations.
 
+use rmcp::schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// What to open. Timeout, progress, and cancel stay on the call — they are
@@ -72,7 +73,7 @@ pub enum ConditionalCloseResult {
 }
 
 /// One warmup step reported by `idb_open`.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 pub struct WarmupStep {
     pub step: String,
     pub ok: bool,
@@ -102,7 +103,7 @@ impl WarmupStep {
 }
 
 /// Worker-side warmup result. Session may prepend an `auto_wait` step.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 pub struct WarmupResult {
     pub ok: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]

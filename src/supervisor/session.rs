@@ -43,6 +43,7 @@ pub struct SessionInfo {
     pub created_at: String,
     pub last_accessed: String,
     pub is_analyzing: bool,
+    #[schemars(schema_with = "json_object_schema")]
     pub metadata: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_active: Option<bool>,
@@ -68,6 +69,7 @@ pub struct OpenedSessionInfo {
     pub created_at: String,
     pub last_accessed: String,
     pub is_analyzing: bool,
+    #[schemars(schema_with = "json_object_schema")]
     pub metadata: Value,
 }
 
@@ -103,7 +105,7 @@ pub struct SessionManager {
 pub struct OpenSessionResult {
     pub success: bool,
     pub session: OpenedSessionInfo,
-    pub warmup: Value,
+    pub warmup: WarmupResult,
     pub message: String,
 }
 
@@ -115,6 +117,13 @@ pub struct CloseSessionResult {
     pub owned: bool,
     pub saved: Option<bool>,
     pub message: String,
+}
+
+/// Session metadata is emitted as a JSON object assembled from IDA's open
+/// result. Keep it as an object in the advertised schema instead of schemars'
+/// unconstrained boolean schema (`true`), which strict MCP clients reject.
+fn json_object_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({"type": "object"})
 }
 
 /// `"ok"` when no native call is in flight, `"busy"` otherwise.
@@ -270,7 +279,7 @@ impl SessionManager {
                             info.filename, info.session_id
                         ),
                         session: OpenedSessionInfo::from(&info),
-                        warmup: WarmupResult::reused().to_json(),
+                        warmup: WarmupResult::reused(),
                     });
                 }
             }
@@ -360,7 +369,7 @@ impl SessionManager {
         Ok(OpenSessionResult {
             success: true,
             session: OpenedSessionInfo::from(&info),
-            warmup: warmup.to_json(),
+            warmup,
             message: format!("Binary opened: {filename} ({session_id})"),
         })
     }
