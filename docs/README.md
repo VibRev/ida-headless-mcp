@@ -8,7 +8,7 @@ process.
 
 - **Supervisor / worker split** — MCP transports stay in the supervisor; IDA SDK calls stay in workers
 - **Session IDs** — `idb_open` returns an opaque `database` handle required by every analysis tool
-- **Streamable HTTP** — Multi-client support behind a mandatory bearer token, plus Origin/Host checks
+- **Streamable HTTP** — Multi-client support behind a mandatory bearer token, plus optional Host checks
 - **Headless-only** — Debugger and GUI control are outside the public surface
 
 ## Contents

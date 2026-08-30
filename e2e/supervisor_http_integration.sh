@@ -51,7 +51,6 @@ trap cleanup EXIT INT TERM
 server_args=(
   serve --mode http
   --bind "127.0.0.1:${PORT}"
-  --allow-origin "http://localhost"
   --allow-host "localhost"
   --token-file "$token_file"
 )
@@ -86,20 +85,10 @@ if [[ -z "$session_id" ]]; then
 fi
 headers+=(-H "Mcp-Session-Id: $session_id")
 
-# The cached-output download endpoint is behind the same Host/Origin guards as
-# /mcp and /sse. A 403 before the id is even looked up is the point: the guard
-# runs as a router-wide layer, so an unreachable output id cannot be probed
-# from a disallowed origin.
-bad_origin_status="$(
-  curl -sS -o /dev/null -w '%{http_code}' \
-    -H "Origin: http://untrusted.example" \
-    "http://127.0.0.1:${PORT}/output/nonexistent.json"
-)"
-if [[ "$bad_origin_status" != "403" ]]; then
-  echo "output endpoint accepted a disallowed Origin (HTTP $bad_origin_status)" >&2
-  exit 1
-fi
-
+# The cached-output download endpoint is behind the same Host guard as /mcp
+# and /sse. A 403 before the id is even looked up is the point: the guard runs
+# as a router-wide layer, so an unreachable output id cannot be probed from a
+# disallowed Host. Origin headers are intentionally not validated.
 bad_host_status="$(
   curl -sS -o /dev/null -w '%{http_code}' \
     -H "Host: untrusted.example" \

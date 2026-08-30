@@ -37,8 +37,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-"$BIN" serve --mode http --bind "127.0.0.1:$PORT" --token-file "$token_file" \
-  --allow-origin "http://localhost,http://127.0.0.1" >"$server_log" 2>&1 &
+"$BIN" serve --mode http --bind "127.0.0.1:$PORT" --token-file "$token_file" >"$server_log" 2>&1 &
 server_pid=$!
 
 init_payload='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"script-test","version":"0.1"},"capabilities":{}}}'

@@ -102,7 +102,6 @@ echo "-- case 1: a process-group interrupt, as a terminal sends it"
 set -m
 "$BIN" serve --mode http \
   --bind "127.0.0.1:${PORT}" \
-  --allow-origin "http://localhost" \
   --token-file "$token_file" \
   >"$server_log" 2>&1 &
 server_pid=$!

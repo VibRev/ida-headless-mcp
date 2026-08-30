@@ -181,7 +181,6 @@ test-http: fixture
         MCP_HTTP_BIND_HOST="0.0.0.0" MCP_HTTP_CONNECT_HOST="127.0.0.1" \
         MCP_HTTP_HOST_HEADER="${issue_host}" \
         MCP_HTTP_ORIGIN="http://${issue_host}" \
-        MCP_HTTP_ALLOW_ORIGIN="http://${issue_host}" \
         MCP_HTTP_ALLOW_HOST="10.10.10.100" \
         PORT="${issue_port}" \
         ./http_integration.sh

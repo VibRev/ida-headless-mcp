@@ -51,13 +51,11 @@ HTTP 传输只提供 **supervisor 面**（`idb_open` / `idb_close`，参数 `inp
 
 > **一条被撤回的记录。** 这里一度写着「`--allow-origin` 的语义从 Origin 变成了 Host」并定为 P0 破坏性变更。**那是错的，测量方法有问题**：HTTP 传输有 `--allow-origin`（Origin 白名单，默认 `http://localhost,http://127.0.0.1`）和 `--allow-host`（额外 Host 头）两个独立的 flag，我把前者的名字和后者的说明看串了，那次「400」是自己 curl 参数写坏造成的。重测：带 `Origin: http://localhost` 是 **200**。`commit 7eed627` 的信息里留有这个错误说法。
 
-### 3. Origin 校验还关不掉，因为它在 kit 里
+### 3. Origin 校验已移除
 
-按仓库所有者的决定，**Origin 和 Host 的限制默认都不开**。Host 已经关了：`--allow-host` 的默认值在本仓改成 `*`，走 kit 的 `HostAllowList::Any`。实测敌意 Host → 200，敌意 Origin → 403，无 token → 401。
+按仓库所有者的决定，Origin 不再校验；Host 仍可通过 `--allow-host` 显式启用。实测敌意 Origin 在有效 token 下可通过，敌意 Host 仍按 Host 策略返回 403，无 token → 401。
 
-Origin 关不掉：kit 的 `validate_origin` 只有两条路——header 不存在就放行，存在就必须精确命中 `allowed_origins` 这个 `HashSet`。**没有通配符分支**，`clean_allowlist` 也只做去空白，所以把默认值设成空反而更严（任何带 Origin 的请求一律 403）。
-
-要关掉需要动 `vibrev-kit`（给 `validate_origin` 加一条 `*` 短路），然后在 vibrev 提交并把本仓三份 lock 的 pin 往前挪。**跨仓库改动，等决定。**
+Origin 校验代码已从 `vibrev-kit` 移除，两个引擎均同步到同一版本。
 
 理由记在这里免得后人当成疏忽：这两个检查防的是 DNS 重绑定（浏览器里的页面把自己控制的域名解析到 127.0.0.1 来打本地监听）。**真正挡住它的是无条件的 bearer token**——那个页面读不到 token 文件。而常开的 Host 校验会误伤反向代理和容器 DNS 名。
 

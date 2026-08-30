@@ -68,7 +68,6 @@ trap cleanup EXIT INT TERM
 # `--unsafe` because the crash is raised through `run_script`, which is gated.
 "$BIN" serve --mode http \
   --bind "127.0.0.1:${PORT}" \
-  --allow-origin "http://localhost" \
   --token-file "$token_file" \
   --max-workers 2 \
   --unsafe \

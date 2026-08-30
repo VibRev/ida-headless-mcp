@@ -205,7 +205,7 @@ enum ServeMode {
 /// that *are* global (`--allow-lumina`, the policy set) are exactly the ones
 /// those commands do read.
 ///
-/// The listener knobs — bind, token, Origin/Host, framing, body cap — are not
+/// The listener knobs — bind, token, Host, framing, body cap — are not
 /// here either. They come from `vibrev_kit::transport::HttpOptions`, which
 /// [`http_options`] hangs on this same subcommand as plain `Arg`s; those names
 /// are shared with `bn-headless-mcp` so two engines cannot spell `--bind` two

@@ -175,7 +175,7 @@ Unlike stdio, this opens a listener, so **every request needs a bearer token** â
 
 The token is elided from that snippet when stderr is not a terminal, so redirected logs and CI output do not leak it; read it back with `head -n1 ~/.vibrev/token`.
 
-HTTP is what `serve` does unless you pass `--mode stdio`, so the command above needs no mode. See [docs/TRANSPORTS.md](docs/TRANSPORTS.md) for authentication, Origin/Host checks, session keep-alive, and the pool flags.
+HTTP is what `serve` does unless you pass `--mode stdio`, so the command above needs no mode. See [docs/TRANSPORTS.md](docs/TRANSPORTS.md) for authentication, optional Host checks, session keep-alive, and the pool flags.
 
 ### Bundled skills
 

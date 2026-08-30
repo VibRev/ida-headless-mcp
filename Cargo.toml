@@ -28,11 +28,11 @@ num-bigint = "0.5.1"
 # Both a build- and a runtime dependency: build.rs packs `skills/` into the
 # binary and `skills export` unpacks it. Both halves of that format live in one
 # crate on purpose — see its module header.
-vibrev-skills = { git = "https://github.com/VibRev/vibrev.git", branch = "main" }
+vibrev-skills = { git = "https://github.com/VibRev/vibrev.git", rev = "f008faa" }
 url = "2.5.8"
 percent-encoding = "2.3.2"
-vibrev-kit = { git = "https://github.com/VibRev/vibrev.git", branch = "main", features = ["http"] }
-vibrev-tool-macros = { git = "https://github.com/VibRev/vibrev.git", branch = "main" }
+vibrev-kit = { git = "https://github.com/VibRev/vibrev.git", rev = "f008faa", features = ["http"] }
+vibrev-tool-macros = { git = "https://github.com/VibRev/vibrev.git", rev = "f008faa" }
 dunce = "1.0.5"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
@@ -128,5 +128,5 @@ cc.workspace = true
 # Spelled out again instead of `.workspace = true` because cargo refuses to let
 # a member turn off default features on a workspace dependency. The source must
 # match the workspace entry exactly or cargo resolves two copies.
-vibrev-skills = { git = "https://github.com/VibRev/vibrev.git", branch = "main", default-features = false }
+vibrev-skills = { git = "https://github.com/VibRev/vibrev.git", rev = "f008faa", default-features = false }
 idalib_build_94 = { package = "idalib-build", git = "https://github.com/blacktop/idalib.git", branch = "sdk-9.4.0", optional = true }

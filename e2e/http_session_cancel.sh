@@ -15,7 +15,6 @@ set -euo pipefail
 PORT="${PORT:-8794}"
 BIN="${MCP_BIN:-${MCP_HTTP_BIN:-${SERVER_BIN:-../target/release/ida-headless-mcp}}}"
 ORIGIN="${MCP_HTTP_ORIGIN:-http://localhost}"
-ALLOW_ORIGIN="${MCP_HTTP_ALLOW_ORIGIN:-http://localhost,http://127.0.0.1}"
 BIND_HOST="${MCP_HTTP_BIND_HOST:-127.0.0.1}"
 CONNECT_HOST="${MCP_HTTP_CONNECT_HOST:-127.0.0.1}"
 THRESHOLD_BYTES=$((50 * 1024 * 1024))
@@ -77,7 +76,6 @@ url="http://$CONNECT_HOST:$PORT/"
 
 RUST_LOG="${RUST_LOG:-info},ida_mcp=info" "$BIN" serve --mode http --token-file "$token_file" \
   --bind "$BIND_HOST:$PORT" \
-  --allow-origin "$ALLOW_ORIGIN" \
   >"$server_log" 2>&1 &
 server_pid=$!
 

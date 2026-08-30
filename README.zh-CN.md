@@ -163,7 +163,7 @@ idb_close(database: "<session_id>")
 
 当 stderr 不是终端时，片段里的 token 会被省略，避免重定向的日志和 CI 输出泄露它；需要时用 `head -n1 ~/.vibrev/token` 读回。
 
-`serve` 不加 `--mode stdio` 就是 HTTP，所以上面这条命令不需要写 mode。鉴权、Origin/Host 检查、会话保活和进程池参数见 [docs/TRANSPORTS.md](docs/TRANSPORTS.md)。
+`serve` 不加 `--mode stdio` 就是 HTTP，所以上面这条命令不需要写 mode。鉴权、可选的 Host 检查、会话保活和进程池参数见 [docs/TRANSPORTS.md](docs/TRANSPORTS.md)。
 
 ### 内置 skill
 

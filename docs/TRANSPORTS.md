@@ -48,11 +48,7 @@ catalog that stdio and HTTP serve; reach it through the `worker` subcommand.)
 - SSE is used for streaming responses within this transport.
 - **Every request needs a bearer token.** See [Authentication](#authentication)
   below — there is no flag that turns it off.
-- The server validates the `Origin` header. `Host` validation is **off by
-  default** — the bearer token is what stops DNS rebinding, and an always-on
-  `Host` check mostly rejects reverse proxies and container DNS names. Name the
-  hosts with `--allow-host` to turn it back on; IP literals reachable through
-  the bind address are then accepted automatically.
+- The server requires the bearer token on every request.
 
 ```bash
 # The default: no arguments needed for a loopback listener
@@ -69,14 +65,12 @@ catalog that stdio and HTTP serve; reach it through the `worker` subcommand.)
 
 # Exposing on a LAN by IP address
 ./target/release/ida-headless-mcp serve \
-  --bind 0.0.0.0:8765 \
-  --allow-origin http://10.0.0.5:8765
+  --bind 0.0.0.0:8765
 
 # Exposing on a LAN by DNS name
 ./target/release/ida-headless-mcp serve \
   --bind 0.0.0.0:8765 \
-  --allow-host ida-box.local \
-  --allow-origin http://ida-box.local:8765
+  --allow-host ida-box.local
 ```
 
 Options:
@@ -94,7 +88,6 @@ Options:
   limit, outside the JSON-RPC envelope.
 - `--token-file`: path to the shared bearer-token file (default
   `~/.vibrev/token`, env `IDA_MCP_TOKEN_FILE`). See [Authentication](#authentication).
-- `--allow-origin`: comma-separated `Origin` allowlist (default: `http://localhost,http://127.0.0.1`)
 - `--allow-host`: comma-separated `Host` allowlist for DNS names or alternate
   authorities. Defaults to `*`, which disables the check; naming any host
   enables it, and IP literals reachable through the bind address are then
@@ -129,8 +122,8 @@ so there is no listener to reach and no token involved.
 
 **Why unconditional, even on loopback.** What the endpoint exposes is opening
 any file on the host as a database — reading arbitrary files is what this tool
-does — plus arbitrary code execution once `--unsafe` is on. `Origin`/`Host`
-validation stops a browser tab from reaching in by DNS rebinding, but it stops
+does — plus arbitrary code execution once `--unsafe` is on. `Host` validation
+can stop a browser tab from reaching in by DNS rebinding, but it stops
 nothing that can open a socket, and every local process can. That is also why
 the `Host` check is not on by default: it defends against one narrow attack the
 token already covers, at the cost of rejecting ordinary proxy setups. On a multi-user
@@ -174,7 +167,7 @@ the credential in your history.
 
 **What a rejected request looks like.** `401` with a `WWW-Authenticate: Bearer`
 challenge for a missing or wrong token — a credential *would* change the
-answer, which is what separates 401 from the `403` the `Origin`/`Host` policy
+answer, which is what separates 401 from the `403` the `Host` policy
 returns. The response body never says anything about the accepted token.
 Coverage is router-wide: `/mcp`, `/sse`, `/output/` and any unrouted path all
 sit behind the same check, so a cached tool result cannot be fetched without
@@ -292,4 +285,3 @@ interrupt: closing the open database before exit; press Ctrl+C again to exit now
 and waits. **A second Ctrl+C exits immediately and the analysis since the last
 save is lost** — that is the escape hatch, not the default, so do not use it to
 hurry a shutdown that is already under way.
-

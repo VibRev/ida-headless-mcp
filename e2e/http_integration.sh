@@ -4,7 +4,6 @@ set -euo pipefail
 PORT="${PORT:-8765}"
 BIN="${MCP_BIN:-${MCP_HTTP_BIN:-${SERVER_BIN:-../target/release/ida-headless-mcp}}}"
 ORIGIN="${MCP_HTTP_ORIGIN:-http://localhost}"
-ALLOW_ORIGIN="${MCP_HTTP_ALLOW_ORIGIN:-http://localhost,http://127.0.0.1}"
 BIND_HOST="${MCP_HTTP_BIND_HOST:-127.0.0.1}"
 CONNECT_HOST="${MCP_HTTP_CONNECT_HOST:-127.0.0.1}"
 HOST_HEADER="${MCP_HTTP_HOST_HEADER:-}"
@@ -41,7 +40,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-server_args=(serve --mode http --bind "$BIND_HOST:$PORT" --allow-origin "$ALLOW_ORIGIN" --token-file "$token_file")
+server_args=(serve --mode http --bind "$BIND_HOST:$PORT" --token-file "$token_file")
 if [[ -n "${MCP_HTTP_ALLOW_HOST+x}" ]]; then
   server_args+=(--allow-host "$MCP_HTTP_ALLOW_HOST")
 fi

@@ -246,8 +246,7 @@ run_http_modern() {
   local url="http://127.0.0.1:$PORT/"
   local log="$tmpdir/http-server.log"
   local discover="{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"server/discover\",\"params\":{\"_meta\":$META}}"
-  RUST_LOG="${RUST_LOG:-info},ida_mcp=info" "$BIN" serve --mode http --bind "127.0.0.1:$PORT" --token-file "$token_file" \
-    --allow-origin "http://localhost,http://127.0.0.1" >"$log" 2>&1 &
+  RUST_LOG="${RUST_LOG:-info},ida_mcp=info" "$BIN" serve --mode http --bind "127.0.0.1:$PORT" --token-file "$token_file" >"$log" 2>&1 &
   server_pid=$!
   wait_http "$url" "$discover" "2026-07-28" "server/discover" \
     "MCP HTTP server listening on http://127.0.0.1:$PORT"
@@ -288,8 +287,7 @@ run_pooled_boundary() {
   local log="$tmpdir/http-server.log"
   local legacy_meta='{"io.modelcontextprotocol/protocolVersion":"2025-11-25","io.modelcontextprotocol/clientInfo":{"name":"ida-mcp-modern-test","version":"0.1"},"io.modelcontextprotocol/clientCapabilities":{}}'
   local discover="{\"jsonrpc\":\"2.0\",\"id\":20,\"method\":\"server/discover\",\"params\":{\"_meta\":$legacy_meta}}"
-  RUST_LOG="${RUST_LOG:-info},ida_mcp=info" "$BIN" serve --mode http --bind "127.0.0.1:$pooled_port" --token-file "$token_file" --max-workers 2 \
-    --allow-origin "http://localhost,http://127.0.0.1" >"$log" 2>&1 &
+  RUST_LOG="${RUST_LOG:-info},ida_mcp=info" "$BIN" serve --mode http --bind "127.0.0.1:$pooled_port" --token-file "$token_file" --max-workers 2 >"$log" 2>&1 &
   server_pid=$!
   wait_http "$url" "$discover" "2025-11-25" "server/discover" \
     "MCP pooled HTTP server listening on http://127.0.0.1:$pooled_port"

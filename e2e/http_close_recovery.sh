@@ -9,7 +9,6 @@ set -euo pipefail
 PORT="${PORT:-8765}"
 BIN="${MCP_BIN:-${MCP_HTTP_BIN:-${SERVER_BIN:-../target/release/ida-headless-mcp}}}"
 ORIGIN="${MCP_HTTP_ORIGIN:-http://localhost}"
-ALLOW_ORIGIN="${MCP_HTTP_ALLOW_ORIGIN:-http://localhost,http://127.0.0.1}"
 BIND_HOST="${MCP_HTTP_BIND_HOST:-127.0.0.1}"
 CONNECT_HOST="${MCP_HTTP_CONNECT_HOST:-127.0.0.1}"
 IDB_PATH="${IDB_PATH:-fixtures/mini}"
@@ -63,7 +62,6 @@ url="http://$CONNECT_HOST:$PORT/"
 
 "$BIN" serve --mode http --token-file "$token_file" \
   --bind "$BIND_HOST:$PORT" \
-  --allow-origin "$ALLOW_ORIGIN" \
   --session-keep-alive-secs "$SESSION_KEEP_ALIVE" \
   >"$server_log" 2>&1 &
 server_pid=$!

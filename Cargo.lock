@@ -2267,7 +2267,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vibrev-kit"
 version = "0.0.1"
-source = "git+https://github.com/VibRev/vibrev.git?branch=main#f556c50cc8620486247ef2ce9dd39a5142f8583c"
+source = "git+https://github.com/VibRev/vibrev.git?rev=f008faa#f008faa062455d7f59a3ce36ca9773d96cd0eacc"
 dependencies = [
  "axum",
  "bytes",
@@ -2287,7 +2287,7 @@ dependencies = [
 [[package]]
 name = "vibrev-skills"
 version = "0.0.1"
-source = "git+https://github.com/VibRev/vibrev.git?branch=main#f556c50cc8620486247ef2ce9dd39a5142f8583c"
+source = "git+https://github.com/VibRev/vibrev.git?rev=f008faa#f008faa062455d7f59a3ce36ca9773d96cd0eacc"
 dependencies = [
  "anyhow",
  "clap",
@@ -2299,7 +2299,7 @@ dependencies = [
 [[package]]
 name = "vibrev-tool-macros"
 version = "0.0.1"
-source = "git+https://github.com/VibRev/vibrev.git?branch=main#f556c50cc8620486247ef2ce9dd39a5142f8583c"
+source = "git+https://github.com/VibRev/vibrev.git?rev=f008faa#f008faa062455d7f59a3ce36ca9773d96cd0eacc"
 dependencies = [
  "darling",
  "proc-macro2",
